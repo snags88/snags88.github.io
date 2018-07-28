@@ -1,0 +1,118 @@
+<!DOCTYPE html> <html> <head> <meta charset="utf-8"> <meta http-equiv="X-UA-Compatible" content="IE=edge"> <meta name="viewport" content="width=device-width, initial-scale=1"> <title>More Authorization with Pundit</title> <meta name="description" content="Ok the whole reason why I wrote my previous post on authorization with Pundit was so that I could talk about more advanced usages of Pundit in our application."> <link rel="stylesheet" href="/assets/css/main.css"> <link rel="canonical" href="http://snags88.github.io/more-authorization-with-pundit"> <link rel="alternate" type="application/rss+xml" title="gem install Seiji" href="http://snags88.github.io/feed.xml"> <script src="/assets/js/modernizr.js"></script> </head> <body"> <main class="wrapper"> <header class="site-header"> <a href="#navbar" id="menu-burger" class="menu-burger">Menu <span class="nav-icon"></span> <svg x="0px" y="0px" width="54px" height="54px" viewBox="0 0 54 54"> <circle fill="transparent" stroke="#000000" stroke-width="1" cx="27" cy="27" r="25" stroke-dasharray="157 157" stroke-dashoffset="157"></circle> </svg> </a> <div id="navbar" class="navbar"> <div class="navigation-wrapper"> <div class="half-block"> <h2>Navigation</h2> <nav> <ul class="no-style primary-nav"> <li><a href="/">Home</a></li> <li><a href="/blog">Blog</a></li> <li><a href="/about">About</a></li> <li><a href="http://github.com/snags88" target="_blank"><i class="icon icon-github"></i> Github</a></li> <li><a href="http://linkedin.com/in/snaganuma" target="_blank"><i class="icon icon-linkedin"></i> LinkedIn</a></li> <li><a href="http://twitter.com/S2k10" target="_blank"><i class="icon icon-twitter"></i> Twitter</a></li> </ul> </nav> </div> </div> </div> </header> <article class="post" itemscope itemtype="http://schema.org/BlogPosting"> <header class="post-header intro"> <div class="intro-in"> <h1 class="post-title" itemprop="name headline">More Authorization with Pundit</h1> <p class="post-meta"><time datetime="2016-07-04T05:30:00-07:00" itemprop="datePublished">Jul 4, 2016</time></p> </div> </header> <div class="post-content container" itemprop="articleBody"> <p>Ok the whole reason why I wrote my <a href="/authorization-with-pundit">previous post on authorization with Pundit</a> was so that I could talk about more advanced usages of Pundit in our application.</p> <p>The Learn app started as a student facing curriculum management system with very simple admin interfaces. The admin tasks included adding students to certain batches and deploying curriculum out to them. However as our use cases grew, the complexity of the admin tasks grew as well. Until finally, we ended up with two large admin apps, the Organizations app and the Curriculum app (among other small admin UIs).</p> <p>We now have a third admin app in development and, though it’s tied to the students, it no longer has the concept of student’s batches. This poses a new kind of challenge since we haven’t been doing authorization by apps. We’ve been inferring the authorization of an app by the combination of the user’s role and the object they have the role for.</p> <p>With that in mind, let’s talk about a solution to handle app specific authorization.</p> <h2 id="creating-the-concept-of-sub-apps">Creating the concept of sub-apps</h2> <p>Since our current implementation requires us to associate a user + role + object, we need to create the concept of sub-apps. The way that I addressed this was to create a new table in our Rails app called <code class="highlighter-rouge">sub_apps</code> and an associated model.</p> <figure class="highlight"><pre><code class="language-ruby" data-lang="ruby"><span class="c1"># Migration</span>
+<span class="k">class</span> <span class="nc">AddSubAppTable</span> <span class="o">&lt;</span> <span class="no">ActiveRecord</span><span class="o">::</span><span class="no">Migration</span>
+  <span class="k">def</span> <span class="nf">change</span>
+    <span class="n">create_table</span> <span class="ss">:sub_apps</span> <span class="k">do</span> <span class="o">|</span><span class="n">t</span><span class="o">|</span>
+      <span class="n">t</span><span class="p">.</span><span class="nf">string</span> <span class="ss">:name</span>
+      <span class="n">t</span><span class="p">.</span><span class="nf">text</span> <span class="ss">:description</span>
+
+      <span class="n">t</span><span class="p">.</span><span class="nf">timestamps</span>
+    <span class="k">end</span>
+  <span class="k">end</span>
+<span class="k">end</span>
+
+<span class="c1"># Model</span>
+<span class="k">class</span> <span class="nc">LearnApp</span> <span class="o">&lt;</span> <span class="no">ActiveRecord</span><span class="o">::</span><span class="no">Base</span>
+<span class="k">end</span></code></pre></figure> <h2 id="create-user-roles-for-the-sub-apps">Create user roles for the sub-apps</h2> <p>We now have all three parts of user + role + object (sub-app), so we can go forward with creating some user roles. For brevity, we’ll only focus on one of the apps. I just threw this into my <code class="highlighter-rouge">rakefile</code>:</p> <figure class="highlight"><pre><code class="language-ruby" data-lang="ruby"><span class="n">namespace</span> <span class="ss">:sub_app_roles</span> <span class="k">do</span>
+  <span class="n">task</span> <span class="ss">seed_curriculum_app: :environment</span> <span class="k">do</span>
+    <span class="n">curriculum_app</span> <span class="o">=</span> <span class="no">SubApp</span><span class="p">.</span><span class="nf">find_or_create_by</span><span class="p">(</span><span class="ss">name: </span><span class="s1">'Curriculum App'</span><span class="p">,</span> <span class="ss">description: </span><span class="s1">'Helps deploy stuff to students'</span><span class="p">)</span>
+    <span class="n">admin_role</span> <span class="o">=</span> <span class="no">Role</span><span class="p">.</span><span class="nf">admin</span>
+    <span class="n">deployer_role</span> <span class="o">=</span> <span class="no">Role</span><span class="p">.</span><span class="nf">deployer</span>
+
+    <span class="no">UserRole</span><span class="p">.</span><span class="nf">find_or_create_by</span><span class="p">(</span><span class="ss">user: </span><span class="no">User</span><span class="p">.</span><span class="nf">find_by</span><span class="p">(</span><span class="ss">username: </span><span class="s1">'AdminUser'</span><span class="p">),</span> <span class="ss">roleable: </span><span class="n">curriculum_app</span><span class="p">,</span> <span class="ss">role: </span><span class="n">admin_role</span><span class="p">)</span>
+    <span class="no">UserRole</span><span class="p">.</span><span class="nf">find_or_create_by</span><span class="p">(</span><span class="ss">user: </span><span class="no">User</span><span class="p">.</span><span class="nf">find_by</span><span class="p">(</span><span class="ss">username: </span><span class="s1">'DeployerUser'</span><span class="p">),</span> <span class="ss">roleable: </span><span class="n">curriculum_app</span><span class="p">,</span> <span class="ss">role: </span><span class="n">deployer_role</span><span class="p">)</span>
+  <span class="k">end</span>
+<span class="k">end</span></code></pre></figure> <p>Running the above task should build an admin user role for <code class="highlighter-rouge">AdminUser</code> and a deployer role for <code class="highlighter-rouge">AdminUser</code>, both for the curriculum app.</p> <h2 id="configuring-our-policy-object">Configuring our policy object</h2> <p>Next, we’ll want to configure a policy object for our <code class="highlighter-rouge">SubApp</code> objects called <code class="highlighter-rouge">SubAppPolicy</code>. In <code class="highlighter-rouge">app/policies/</code> create a file called <code class="highlighter-rouge">sub_app_policy.rb</code> and create some general authorization rules for the sub apps:</p> <figure class="highlight"><pre><code class="language-ruby" data-lang="ruby"><span class="c1"># app/policies/sub_app_policy.rb</span>
+
+<span class="k">class</span> <span class="nc">SubAppPolicy</span> <span class="o">&lt;</span> <span class="no">ApplicationPolicy</span>
+
+  <span class="k">def</span> <span class="nf">general_access?</span>
+    <span class="o">!!</span><span class="n">user</span><span class="p">.</span><span class="nf">user_role_for</span><span class="p">(</span><span class="n">record</span><span class="p">)</span>
+  <span class="k">end</span>
+
+  <span class="k">def</span> <span class="nf">admin_view?</span>
+    <span class="n">user</span><span class="p">.</span><span class="nf">has_role?</span><span class="p">(</span><span class="n">record</span><span class="p">,</span> <span class="ss">:admin</span><span class="p">)</span>
+  <span class="k">end</span>
+
+  <span class="k">def</span> <span class="nf">send_invitations?</span>
+    <span class="n">user</span><span class="p">.</span><span class="nf">has_role?</span><span class="p">(</span><span class="n">record</span><span class="p">,</span> <span class="ss">:admin</span><span class="p">)</span>
+  <span class="k">end</span>
+<span class="k">end</span></code></pre></figure> <p>Remember from the previous post about <code class="highlighter-rouge">Pundit</code> that the policy objects take in a user and a record object. Each of the instance methods defined can be used in the controller to authorize a particular action:</p> <figure class="highlight"><pre><code class="language-ruby" data-lang="ruby"><span class="c1"># app/controllers/curriculum_controller.rb</span>
+
+<span class="k">class</span> <span class="nc">CurriculumController</span> <span class="o">&lt;</span> <span class="no">ApplicationController</span>
+  <span class="k">def</span> <span class="nf">index</span>
+    <span class="n">curriculum_app</span> <span class="o">=</span> <span class="no">SubApp</span><span class="p">.</span><span class="nf">find_by</span><span class="p">(</span><span class="ss">name: </span><span class="s1">'Curriculum App'</span><span class="p">)</span>
+    <span class="n">authorize</span> <span class="n">curriculum_app</span><span class="p">,</span> <span class="ss">:general_access?</span>
+  <span class="k">end</span>
+<span class="k">end</span></code></pre></figure> <p>Great, now we can use the <code class="highlighter-rouge">SubAppPolicy</code> to authorize users. So another example might be authorizing a user to deploy curriculum out to students:</p> <figure class="highlight"><pre><code class="language-ruby" data-lang="ruby"><span class="c1"># app/policies/sub_app_policy.rb</span>
+
+<span class="k">class</span> <span class="nc">SubAppPolicy</span> <span class="o">&lt;</span> <span class="no">ApplicationPolicy</span>
+  <span class="c1"># ...</span>
+
+  <span class="k">def</span> <span class="nf">deploy_access?</span>
+    <span class="n">user</span><span class="p">.</span><span class="nf">has_role?</span><span class="p">(</span><span class="n">record</span><span class="p">,</span> <span class="ss">:deployer</span><span class="p">)</span>
+  <span class="k">end</span>
+
+  <span class="c1"># ...</span>
+<span class="k">end</span>
+
+<span class="c1"># app/controllers/deployment_controller.rb</span>
+
+<span class="k">class</span> <span class="nc">DeploymentController</span> <span class="o">&lt;</span> <span class="no">ApplicationController</span>
+  <span class="k">def</span> <span class="nf">create</span>
+    <span class="n">curriculum_app</span> <span class="o">=</span> <span class="no">SubApp</span><span class="p">.</span><span class="nf">find_by</span><span class="p">(</span><span class="ss">name: </span><span class="s1">'Curriculum App'</span><span class="p">)</span>
+    <span class="n">authorize</span> <span class="n">curriculum_app</span><span class="p">,</span> <span class="ss">:deploy_access?</span>
+  <span class="k">end</span>
+<span class="k">end</span></code></pre></figure> <p>Hmm… that particular implementation feels weird though. All <code class="highlighter-rouge">SubApps</code> should have an authorization method called <code class="highlighter-rouge">deploy_access?</code>. It would be confusing for anyone working with this code in the future to figure out where I’m authorizing the user to deploy content.</p> <h2 id="method-delegation-to-other-policy-objects">Method delegation to other policy objects</h2> <p>Remember that at the core of it, the <code class="highlighter-rouge">authorize</code> helper method is doing the following things:</p> <ul> <li>Get the class of the object and instantiate the policy object for that class. For our particular case:</li> </ul> <figure class="highlight"><pre><code class="language-ruby" data-lang="ruby"><span class="n">policy_class</span> <span class="o">=</span> <span class="s2">"</span><span class="si">#{</span><span class="n">curriculum_app</span><span class="p">.</span><span class="nf">class</span><span class="p">.</span><span class="nf">to_s</span><span class="si">}</span><span class="s2">Policy"</span><span class="p">.</span><span class="nf">classify</span>
+<span class="n">policy_object</span> <span class="o">=</span> <span class="n">policy_class</span><span class="p">.</span><span class="nf">new</span><span class="p">(</span><span class="n">current_user</span><span class="p">,</span> <span class="n">curriculum_app</span><span class="p">)</span></code></pre></figure> <ul> <li>Send the method passed in as the second argument:</li> </ul> <figure class="highlight"><pre><code class="language-ruby" data-lang="ruby"><span class="n">policy_object</span><span class="p">.</span><span class="nf">deploy_access?</span></code></pre></figure> <ul> <li>If it returns a truthy value, then allow, otherwise raise an authorization error.</li> </ul> <p>Armed with this knowledge, we can delegate missing methods out to more sub app specific policy objects.</p> <p>When implementing something like this, I usually like to whitelist the objects that the method calls will be delegated out to. In order to do so, let’s just create a mapping:</p> <figure class="highlight"><pre><code class="language-ruby" data-lang="ruby"><span class="c1"># app/policies/sub_app_policy.rb</span>
+
+<span class="k">class</span> <span class="nc">SubAppPolicy</span> <span class="o">&lt;</span> <span class="no">ApplicationPolicy</span>
+
+  <span class="c1"># Mapping of app name to policy object</span>
+  <span class="no">APP_POLICY_MAPPING</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s1">'Curriculum App'</span><span class="p">:</span> <span class="no">SubApp</span><span class="o">::</span><span class="no">CurriculumPolicy</span>
+  <span class="p">}</span>
+
+  <span class="c1"># ...</span>
+<span class="k">end</span></code></pre></figure> <p>Next, we’ll override the <code class="highlighter-rouge">method_missing</code> method for the <code class="highlighter-rouge">SubAppPolicy</code> objects to try to delegate out to the specific app policy objects if allowed.</p> <figure class="highlight"><pre><code class="language-ruby" data-lang="ruby"><span class="c1"># app/policies/sub_app_policy.rb</span>
+
+<span class="k">class</span> <span class="nc">SubAppPolicy</span> <span class="o">&lt;</span> <span class="no">ApplicationPolicy</span>
+  <span class="c1"># ...</span>
+
+  <span class="k">def</span> <span class="nf">method_missing</span><span class="p">(</span><span class="nb">method</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">block</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">policy_class</span> <span class="o">=</span> <span class="no">APP_POLICY_MAPPING</span><span class="p">[</span><span class="n">record</span><span class="p">.</span><span class="nf">name</span><span class="p">.</span><span class="nf">to_sym</span><span class="p">]</span>
+      <span class="n">policy_object</span> <span class="o">=</span> <span class="n">policy_class</span><span class="p">.</span><span class="nf">new</span><span class="p">(</span><span class="n">user</span><span class="p">,</span> <span class="n">record</span><span class="p">)</span>
+
+      <span class="n">policy_object</span><span class="p">.</span><span class="nf">send</span><span class="p">(</span><span class="nb">method</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">block</span><span class="p">)</span>
+    <span class="k">else</span>
+      <span class="k">super</span>
+    <span class="k">end</span>
+  <span class="k">end</span>
+<span class="k">end</span></code></pre></figure> <p>Cool, now all we have to do is set up the <code class="highlighter-rouge">deploy_access?</code> method in the <code class="highlighter-rouge">SubApp::CurriculumPolicy</code>.</p> <figure class="highlight"><pre><code class="language-ruby" data-lang="ruby"><span class="c1"># app/policies/sub_app/curriculum_policy.rb</span>
+
+<span class="k">class</span> <span class="nc">SubApp</span><span class="o">::</span><span class="no">CurriculumPolicy</span> <span class="o">&lt;</span> <span class="no">ApplicationPolicy</span>
+
+  <span class="k">def</span> <span class="nf">deployer_access?</span>
+    <span class="n">user</span><span class="p">.</span><span class="nf">has_role?</span><span class="p">(</span><span class="n">record</span><span class="p">,</span> <span class="ss">:admin</span><span class="p">,</span> <span class="ss">:deployer</span><span class="p">)</span>
+  <span class="k">end</span>
+<span class="k">end</span></code></pre></figure> <h2 id="friendly-errors">Friendly errors</h2> <p>Almost done! The last thing we want to do is that if the specific app policy object also doesn’t know how to respond to the method, we want to give a more descriptive error message. We can rescue a <code class="highlighter-rouge">NoMethodError</code> and add our own messaging to it:</p> <figure class="highlight"><pre><code class="language-ruby" data-lang="ruby"><span class="c1"># app/policies/sub_app_policy.rb</span>
+
+<span class="k">class</span> <span class="nc">SubAppPolicy</span> <span class="o">&lt;</span> <span class="no">ApplicationPolicy</span>
+  <span class="c1"># ...</span>
+
+  <span class="k">def</span> <span class="nf">method_missing</span><span class="p">(</span><span class="nb">method</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">block</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">policy_class</span> <span class="o">=</span> <span class="no">APP_POLICY_MAPPING</span><span class="p">[</span><span class="n">record</span><span class="p">.</span><span class="nf">name</span><span class="p">.</span><span class="nf">to_sym</span><span class="p">]</span>
+      <span class="n">policy_object</span> <span class="o">=</span> <span class="n">policy_class</span><span class="p">.</span><span class="nf">new</span><span class="p">(</span><span class="n">user</span><span class="p">,</span> <span class="n">record</span><span class="p">)</span>
+
+      <span class="k">begin</span>
+        <span class="n">policy_object</span><span class="p">.</span><span class="nf">send</span><span class="p">(</span><span class="nb">method</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">block</span><span class="p">)</span>
+      <span class="k">rescue</span> <span class="no">NoMethodError</span>
+        <span class="k">raise</span> <span class="no">MethodDelegationError</span><span class="p">.</span><span class="nf">new</span> <span class="s2">"undefined method </span><span class="se">\"</span><span class="si">#{</span><span class="nb">method</span><span class="si">}</span><span class="se">\"</span><span class="s2"> for &lt;SubAppPolicy&gt; and &lt;</span><span class="si">#{</span><span class="n">policy_object</span><span class="p">.</span><span class="nf">class</span><span class="p">.</span><span class="nf">to_s</span><span class="si">}</span><span class="s2">&gt;"</span>
+      <span class="k">end</span>
+    <span class="k">else</span>
+      <span class="k">super</span>
+    <span class="k">end</span>
+  <span class="k">end</span>
+
+  <span class="k">class</span> <span class="nc">MethodDelegationError</span> <span class="o">&lt;</span> <span class="no">StandardError</span>
+  <span class="k">end</span>
+<span class="k">end</span></code></pre></figure> <p>With the above custom error, our message will look something like <code class="highlighter-rouge">SubAppPolicy::MethodDelegationError: undefined method "some_crazy_method_name" for &lt;SubAppPolicy&gt; and &lt;SubApp::CurriculumPolicy&gt;</code></p> <h2 id="conclusion">Conclusion</h2> <p>Now that we have this in place, it should be more easy to find app specific authorization calls as well as general authorization across the apps.</p> <p>Note that there are definitely other ways to go about solving this issue, like starting to create separate apps as opposed to a monolithic Rails app, but given the constraints and requirements, this was the best way to tackle the issue in this case.</p> </div> </article> <footer class="site-footer"> <div class="container"> <ul class="social"> <li><a href="http://github.com/snags88" target="_blank"><i class="icon icon-github"></i></a></li> <li><a href="http://linkedin.com/in/snaganuma" target="_blank"><i class="icon icon-linkedin"></i></a></li> <li><a href="http://twitter.com/S2k10" target="_blank"><i class="icon icon-twitter"></i></a></li> </ul> <p> <small>&copy;2018 All rights reserved. Powered by <a href="http://jekyllrb.com/" target="_blank">Jekyll</a> with <a href="https://github.com/nandomoreirame/dotX" target="_blank">dotX</a> theme.</small> </p> </div> </footer> </main> <script src="/assets/js/jquery-2.1.1.js"></script> <script src="/assets/js/main.js"></script> </body> </html>

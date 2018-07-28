@@ -1,0 +1,1666 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>gem install Seiji</title>
+    <description>A blog about Seiji&#39;s programming adventures.</description>
+    <link>http://snags88.github.io/</link>
+    <atom:link href="http://snags88.github.io/feed.xml" rel="self" type="application/rss+xml"/>
+    <pubDate>Fri, 27 Jul 2018 21:38:49 -0700</pubDate>
+    <lastBuildDate>Fri, 27 Jul 2018 21:38:49 -0700</lastBuildDate>
+    <generator>Jekyll v3.0.5</generator>
+    
+      <item>
+        <title>Backoff Strategy for Laravel Jobs</title>
+        <description>&lt;h2 id=&quot;what-are-jobs&quot;&gt;What are jobs?&lt;/h2&gt;
+&lt;p&gt;Background jobs are key to any seemingly fast application. They’re
+really useful for running tasks asynchronously so that your user isn’t
+waiting for some code to run that doesn’t directly impact their
+experience in the app.&lt;/p&gt;
+
+&lt;p&gt;One small example of using a background job is when a user logs in to
+our app, we want to update their &lt;code class=&quot;highlighter-rouge&quot;&gt;last_logged_in_at&lt;/code&gt; timestamp in our
+database. From the user’s perspective, do they really care about this
+timestamp? Nope, not really. This would be a perfect time to use a
+background job to do a database write operation.&lt;/p&gt;
+
+&lt;h2 id=&quot;how-do-jobs-work&quot;&gt;How do jobs work?&lt;/h2&gt;
+&lt;p&gt;When these jobs are initially fired off, they are put onto the
+application’s queue. The queue could be anything as long as it tracks
+the jobs’ information. Some are backed by the application’s database,
+Redis, RabbitMQ, etc.&lt;/p&gt;
+
+&lt;p&gt;Once the jobs are on the queue, there is a worker process that will grab
+jobs off of the queue and execute the job’s code.&lt;/p&gt;
+
+&lt;h2 id=&quot;configuring-jobs-in-laravel&quot;&gt;Configuring jobs in Laravel&lt;/h2&gt;
+&lt;p&gt;Laravel provides background jobs for us out of the box. All you need to
+do is create a plain old class, add some traits, implement an interface,
+and dispatch it from your main app code.&lt;/p&gt;
+
+&lt;p&gt;For more information about managing jobs in Laravel, take a look at
+their &lt;a href=&quot;https://laravel.com/docs/5.6/queues#creating-jobs&quot; target=&quot;_blank&quot;&gt;detailed documentation&lt;/a&gt;.&lt;/p&gt;
+
+&lt;h2 id=&quot;backoff-strategy&quot;&gt;Backoff strategy?&lt;/h2&gt;
+&lt;p&gt;In modern applications when an issue occurs, there is an attempt to
+retry the block of code that caused the issue. For example, if you are
+on GMail and you lose internet connection, the website will attempt to
+reconnect to the Google servers. What you might notice is that on the
+first try, it will attempt to reconnect immediately. Then it’ll wait a
+few seconds and try again. Then wait 10-15 second and try again. Then
+another 30-40 second wait, etc. What you experienced is called a backoff
+strategy for reattempting a failed task.&lt;/p&gt;
+
+&lt;p&gt;As you can imagine, with queued jobs, it would be great to adopt this
+strategy especially for jobs that deal with third-party APIs. If the
+third-party is down, then it may take some time for it to come back up
+so it’s beneficial to have a backoff strategy.&lt;/p&gt;
+
+&lt;p&gt;Sadly, Laravel does not have a backoff strategy built into their jobs.
+However, with the failed job handling it exposes to us, we can write our
+own retriable job easily. The particular backoff strategy we’ll
+implement is called an exponential backoff strategy because we increase
+our backoff exponentially (i.e. 2, 4, 8, 16, 32, etc.).&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;namespace&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;App\Jobs&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;abstract&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;RetriableJob&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$tries&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt; &lt;span class=&quot;c1&quot;&gt;// override default and make sure we don&#39;t requeue automatically
+&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$currentRetryCount&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$maxRetries&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;7&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt; &lt;span class=&quot;c1&quot;&gt;// 3, 9, 27, 81, 243, 729, 2187 seconds
+&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$backoffFactor&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;3&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;failed&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nx&quot;&gt;\Exception&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$e&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;currentRetryCount&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;lt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;maxRetries&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+            &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;delay&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nx&quot;&gt;now&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;addSeconds&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;backoffFactor&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;**&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;currentRetryCount&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;));&lt;/span&gt;
+            &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;currentRetryCount&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+            &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;dispatch&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+        &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;The implementation above uses the &lt;code class=&quot;highlighter-rouge&quot;&gt;failed&lt;/code&gt; hook to update the job’s
+traits &lt;code class=&quot;highlighter-rouge&quot;&gt;delay&lt;/code&gt; and &lt;code class=&quot;highlighter-rouge&quot;&gt;currentRetryCount&lt;/code&gt;. Afterwards, it redispatches the
+job onto the queue.&lt;/p&gt;
+
+&lt;p&gt;To use this, you just need to inherit the abstract class to your job:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;namespace&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;App\Jobs&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;use&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Illuminate\Contracts\Queue\ShouldQueue&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;MyJob&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;extends&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;RetriableJob&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;implements&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;ShouldQueue&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;handle&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;c1&quot;&gt;// Do my job
+&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;h2 id=&quot;future-improvements&quot;&gt;Future Improvements&lt;/h2&gt;
+&lt;p&gt;This isn’t the cleanest implementation since we try a job once, and then
+we just requeue it. To do this correctly, we actually need to dive into the
+framework itself and update the code. Ideally the code would be changed
+so that when the worker processes the job and it has multiple &lt;code class=&quot;highlighter-rouge&quot;&gt;tries&lt;/code&gt;,
+it would allow use to specify a &lt;code class=&quot;highlighter-rouge&quot;&gt;delay&lt;/code&gt; time before we release it back
+into the queue.&lt;/p&gt;
+
+&lt;p&gt;In any case, the implementation is easy to understand and shouldn’t have
+any performance impact on the worker queue. I couldn’t really find a
+good example of this online when I needed to implement it, so hopefully
+this helps someone in the future.&lt;/p&gt;
+</description>
+        <pubDate>Fri, 27 Jul 2018 18:51:00 -0700</pubDate>
+        <link>http://snags88.github.io/backoff-strategy-for-laravel-jobs</link>
+        <guid isPermaLink="true">http://snags88.github.io/backoff-strategy-for-laravel-jobs</guid>
+        
+        
+        <category>general</category>
+        
+      </item>
+    
+      <item>
+        <title>The Proxy Pattern in Laravel</title>
+        <description>&lt;p&gt;Proxy is one of those words that makes you sound technically smart and
+it’s seen an increase in usage over the last 20 years
+according to &lt;a href=&quot;https://books.google.com/ngrams/graph?content=proxy&amp;amp;case_insensitive=on&amp;amp;year_start=1940&amp;amp;year_end=2018&amp;amp;corpus=15&amp;amp;smoothing=7&amp;amp;share=&amp;amp;direct_url=t4%3B%2Cproxy%3B%2Cc0%3B%2Cs0%3B%3Bproxy%3B%2Cc0%3B%3BProxy%3B%2Cc0%3B%3BPROXY%3B%2Cc0#t4%3B%2Cproxy%3B%2Cc0%3B%2Cs0%3B%3Bproxy%3B%2Cc1%3B%3BProxy%3B%2Cc0%3B%3BPROXY%3B%2Cc0&quot; target=&quot;_blank&quot;&gt;Google Books Ngram Viewer&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;Well what does proxy even mean? Lets take a look in more detail.&lt;/p&gt;
+
+&lt;h2 id=&quot;proxy-pattern&quot;&gt;Proxy Pattern&lt;/h2&gt;
+&lt;p&gt;The word &lt;em&gt;proxy&lt;/em&gt; often means something that replaces
+something else and behaves similar to the original object. An example of
+a proxy is when you give the authority to someone to vote on your
+behalf; it’s called proxy voting.&lt;/p&gt;
+
+&lt;p&gt;The proxy pattern in OOP follows a similar concept in that a proxy object
+stands in place of a real object. That proxy object generally forwards
+the instuctions on to the real object, but could add additional
+functionality as needed.&lt;/p&gt;
+
+&lt;p&gt;The simplest implementation of a proxy object just uses the magic
+&lt;code class=&quot;highlighter-rouge&quot;&gt;__call&lt;/code&gt; function to dynamically pass along missing methods to the real
+object:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;Proxy&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$obj&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+  &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__construct&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$obj&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;obj&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$obj&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+  &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__call&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$parameters&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;obj&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}(&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;...&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$parameters&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Well that’s easy enough in PHP. Gotta love that syntactic sugar.&lt;/p&gt;
+
+&lt;h2 id=&quot;proxy-pattern-in-the-wild-&quot;&gt;Proxy Pattern in the Wild 🕵️&lt;/h2&gt;
+&lt;p&gt;There are various uses for the proxy pattern. People give examples of
+lazy loading files to authorizing method calls in proxy objects.
+Interestingly, I found a place in the Laravel framework that uses the
+proxy pattern for neither of these purposes.&lt;/p&gt;
+
+&lt;p&gt;Remember that time Taylor Otwell wrote about the &lt;code class=&quot;highlighter-rouge&quot;&gt;tap&lt;/code&gt; function that was
+inspired by the same named method in Ruby? Well &lt;a href=&quot;https://medium.com/@taylorotwell/tap-tap-tap-1fc6fc1f93a6&quot; target=&quot;_blank&quot;&gt;here&lt;/a&gt; is his original post. In it, he describes two ways to 
+use the &lt;code class=&quot;highlighter-rouge&quot;&gt;tap&lt;/code&gt; helper function. The first way has 2 arguments:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;nx&quot;&gt;tap&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$object&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$object&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;$object&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;save&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;});&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;The second passes along only 1 argument, then chains a method, and he
+claims that it returns the original object:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;tap&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$user&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;update&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;([&lt;/span&gt;
+    &lt;span class=&quot;s1&quot;&gt;&#39;name&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$name&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+    &lt;span class=&quot;s1&quot;&gt;&#39;age&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$age&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;]);&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;I was digging around and found where the &lt;code class=&quot;highlighter-rouge&quot;&gt;tap&lt;/code&gt; helper function is
+defined and this is what the code looks like:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;!&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;function_exists&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;&#39;tap&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;))&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;c1&quot;&gt;// Call the given Closure with the given value then return the value.
+&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;tap&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$value&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$callback&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kc&quot;&gt;null&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;is_null&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$callback&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;))&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+            &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;HigherOrderTapProxy&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$value&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+        &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$callback&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$value&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$value&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;So the &lt;code class=&quot;highlighter-rouge&quot;&gt;if&lt;/code&gt; block handles when it’s 1 argument and the remaining code
+handles when there’s 2 arguments. Interesting. So what is this
+&lt;code class=&quot;highlighter-rouge&quot;&gt;HigherOrderTapProxy&lt;/code&gt; that gets returned instead of the original object?
+Let’s take a look:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;namespace&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Illuminate\Support&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;HigherOrderTapProxy&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$target&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__construct&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$target&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;target&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$target&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__call&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$parameters&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;target&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}(&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;...&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$parameters&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;target&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Ahh I see. So this proxy object just intercepts the method call
+on the object, calls the method with the parameters, but ignores the
+return value of that method call, and then always returns the “target”
+&lt;em&gt;aka&lt;/em&gt; the original object.&lt;/p&gt;
+
+&lt;p&gt;BAM proxy pattern in real life. Definitely did not think I would find
+one in Laravel that would be easy to understand, but there you have it!
+Until next time, happy coding!&lt;/p&gt;
+</description>
+        <pubDate>Mon, 04 Jun 2018 18:51:00 -0700</pubDate>
+        <link>http://snags88.github.io/proxy-pattern-in-laravel</link>
+        <guid isPermaLink="true">http://snags88.github.io/proxy-pattern-in-laravel</guid>
+        
+        
+        <category>general</category>
+        
+      </item>
+    
+      <item>
+        <title>The Facade Pattern in Laravel</title>
+        <description>&lt;p&gt;Next up on the structural pattern is the &lt;em&gt;Facade&lt;/em&gt; pattern. Supposedly,
+it derives its name from the word facade, which (according to Google) means:&lt;/p&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;the face of a building, especially the principal front that looks onto a street or open space.&lt;/li&gt;
+  &lt;li&gt;an outward appearance that is maintained to conceal a less pleasant or creditable reality.&lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;I’m a fan of definition #2 there because it really describes the purpose
+of the facade pattern in layman’s terms.&lt;/p&gt;
+
+&lt;h2 id=&quot;facade-pattern&quot;&gt;Facade Pattern&lt;/h2&gt;
+&lt;p&gt;Understandably, the facade pattern is often confused with the adapter
+pattern because you’re using a class to present a less complex API to
+the outside word. However, I think one of the biggest differences is
+that the facade pattern can actually encapsulate many classes that are
+coordinating together to accomplish a complex task.&lt;/p&gt;
+
+&lt;p&gt;For example, we could start with an interface that enforces the
+facade:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;interface&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;FastFoodFacade&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;orderComboOne&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;orderComboTwo&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Then we might have classes that implements the interface that
+coordinates various classes:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;McDonalds&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;implements&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;FastFoodFacade&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;orderComboOne&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$food&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;McDouble&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;())&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;withCheese&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$drink&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Drink&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;())&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;size&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;&#39;large&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$fries&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Fries&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;())&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;size&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;&#39;large&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+
+        &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;
+            &lt;span class=&quot;s1&quot;&gt;&#39;food&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$food&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+            &lt;span class=&quot;s1&quot;&gt;&#39;drink&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$drink&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+            &lt;span class=&quot;s1&quot;&gt;&#39;extra&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$fries&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;
+        &lt;span class=&quot;p&quot;&gt;];&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;orderComboTwo&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$food&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;McNuggets&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;())&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;count&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;10&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$drink&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Drink&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;())&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;size&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;&#39;medium&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$sauce&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Sauce&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;&#39;Bbq&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;));&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$sauce2&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Sauce&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;&#39;honeyMustard&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;));&lt;/span&gt;
+
+        &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;
+            &lt;span class=&quot;s1&quot;&gt;&#39;food&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$food&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+            &lt;span class=&quot;s1&quot;&gt;&#39;drink&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$drink&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+            &lt;span class=&quot;s1&quot;&gt;&#39;extra&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$sauce&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$sauce2&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;
+        &lt;span class=&quot;p&quot;&gt;];&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;We could extend this pattern to another class like &lt;code class=&quot;highlighter-rouge&quot;&gt;Arbys&lt;/code&gt; and implement
+the same type of facade. When the outside world is interacting with any
+fastfood class, we know that we can order combo meal #1 or combo meal
+#2.&lt;/p&gt;
+
+&lt;h2 id=&quot;facade-pattern-in-the-wild-&quot;&gt;Facade Pattern in the Wild 🕵️&lt;/h2&gt;
+&lt;p&gt;If you’ve been using Laravel for sometime, you probably noticed things
+called Facades exist in Laravel. They are in
+&lt;code class=&quot;highlighter-rouge&quot;&gt;Illuminate\Support\Facades\..&lt;/code&gt; and many of the common tools in the
+framework like &lt;code class=&quot;highlighter-rouge&quot;&gt;Queue&lt;/code&gt;, &lt;code class=&quot;highlighter-rouge&quot;&gt;Job&lt;/code&gt;, and &lt;code class=&quot;highlighter-rouge&quot;&gt;Event&lt;/code&gt; are called through these
+facades.&lt;/p&gt;
+
+&lt;p&gt;I’v been using these facades, but didn’t really dig into them until I
+started writing this and here’s how they work.&lt;/p&gt;
+
+&lt;p&gt;All facades inherit from the abstract facade class in
+&lt;a href=&quot;https://github.com/laravel/framework/blob/5.6/src/Illuminate/Support/Facades/Facade.php&quot; target=&quot;_blank&quot;&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;Illuminate\Support\Facades\Facade&lt;/code&gt;&lt;/a&gt;.
+That particular abstract class implements a lot of test helpers that
+allow you to mock out the facade like &lt;code class=&quot;highlighter-rouge&quot;&gt;shouldReceive&lt;/code&gt; or &lt;code class=&quot;highlighter-rouge&quot;&gt;spy&lt;/code&gt;. The
+other important part is that it also defines a delegation function for
+any missing static functions called on the class:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;static&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__callStatic&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$args&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;$instance&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;static&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;getFacadeRoot&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;!&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$instance&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;throw&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;RuntimeException&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;&#39;A facade root has not been set.&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$instance&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;...&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$args&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;For any missing static functions, the above function will try to
+forward the method to the instance to whatever is being facaded (is that
+even a word? 😂).&lt;/p&gt;
+
+&lt;p&gt;Finally, the concrete facade classes implements the abstract class and
+needs to define one method at the minimum called &lt;code class=&quot;highlighter-rouge&quot;&gt;getFacadeAccessor&lt;/code&gt;.
+That function should return the string name of the object as it has been
+registered in the service provider.&lt;/p&gt;
+
+&lt;p&gt;Lets take a look at the &lt;code class=&quot;highlighter-rouge&quot;&gt;Queue&lt;/code&gt; facade for example. This is the implementation
+of &lt;code class=&quot;highlighter-rouge&quot;&gt;getFacadeAccessor&lt;/code&gt;:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;protected&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;static&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;getFacadeAccessor&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;queue&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;And in &lt;code class=&quot;highlighter-rouge&quot;&gt;QueueServiceProvider&lt;/code&gt; we see that that the &lt;code class=&quot;highlighter-rouge&quot;&gt;QueueManager&lt;/code&gt; gets
+registered to the app container as &lt;code class=&quot;highlighter-rouge&quot;&gt;queue&lt;/code&gt;:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;protected&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;registerManager&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;app&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;singleton&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;&#39;queue&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$app&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;tap&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;QueueManager&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$app&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;),&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$manager&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+            &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;registerConnectors&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$manager&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+        &lt;span class=&quot;p&quot;&gt;});&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;});&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;What’s really cool is that you can build onto this pattern and create
+your own facades in your app or as a library. One of the libraries we
+use called
+&lt;a href=&quot;https://docs.bugsnag.com/platforms/php/laravel/&quot; target=&quot;_blank&quot;&gt;Bugsnag&lt;/a&gt;
+implements its own facade so we can easily use its functionality without
+having to reach into the app container all the time.&lt;/p&gt;
+
+&lt;p&gt;Apparently some people don’t consider this to be a real facade pattern,
+but I feel like it does coordinate complex interactions behind the
+scenes so that we can easily use the tools that Laravel provides for us.
+There no need to resolve the queue manager every time we want to use it.&lt;/p&gt;
+
+&lt;p&gt;Well hopefully that gave some insight to the facade pattern in OOP and
+the facade concept in Laravel. Until next time, happy coding! 😎&lt;/p&gt;
+</description>
+        <pubDate>Sat, 02 Jun 2018 13:51:00 -0700</pubDate>
+        <link>http://snags88.github.io/facade-pattern-in-laravel</link>
+        <guid isPermaLink="true">http://snags88.github.io/facade-pattern-in-laravel</guid>
+        
+        
+        <category>general</category>
+        
+      </item>
+    
+      <item>
+        <title>The Adapater Pattern in Laravel</title>
+        <description>&lt;p&gt;Now that we’ve finished the creational patterns, we’re moving on to
+structural patterns. These patterns focus primarily on the composition
+of classes and objects in order to create a scaleable structure for the
+application. There are seven total patterns in this family and we’ll
+take a look one by one. First up: the Adapter pattern.&lt;/p&gt;
+
+&lt;h2 id=&quot;adapter-pattern&quot;&gt;Adapter Pattern&lt;/h2&gt;
+&lt;p&gt;The Adapter pattern is often used when we have preexisting code that
+needs to be used but doesn’t have the expected API that the outside
+world expects. You’ll run into this type of situation a lot when you’re
+working with third-party libraries and you need to swap out an old
+library for a new one (i.e. switching from Nexmo to Twilio for sending SMS).
+The new library may not have the exact same API as the old, so in this
+situation, you’re left with two choices:&lt;/p&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;Rewrite everything in your app to conform to the library’s API.&lt;/li&gt;
+  &lt;li&gt;Write an adapter or a wrapper around the library to conform to the
+API your app expects.&lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;In general, even if it’s your first time using a third-party library, it
+helps to write a wrapper around the library in case you ever need to
+swap out the library. For instance, you might name the Twilio library
+&lt;code class=&quot;highlighter-rouge&quot;&gt;SmsClientAdapter&lt;/code&gt; to keep it generic. Now, your app doesn’t care if the
+adapter uses the Twilio library or the Nexmo library.&lt;/p&gt;
+
+&lt;h2 id=&quot;adapter-pattern-in-the-wild-&quot;&gt;Adapter Pattern in the Wild 🕵️&lt;/h2&gt;
+&lt;p&gt;In the world of Laravel, or any large framework for that matter, we are
+able to choose the data storage that best fits are app’s needs. One of
+the storage types in Laravel is Redis, a fast storage solution that can
+be used for caching or storing simple key-value pairs.&lt;/p&gt;
+
+&lt;p&gt;In PHP, there are two popular clients for Redis (&lt;a href=&quot;https://github.com/phpredis/phpredis&quot; target=&quot;_blank&quot;&gt;PhpRedis&lt;/a&gt;
+and &lt;a href=&quot;https://github.com/nrk/predis&quot; target=&quot;_blank&quot;&gt;Predis&lt;/a&gt;) that
+Laravel lets you choose from. After you configure the Redis driver,
+Laravel will work its magic and allow you to send commands to your Redis
+server.&lt;/p&gt;
+
+&lt;p&gt;I wanted to dig into this code a little bit to see if there was some
+kind of adapter pattern. We can start at a &lt;code class=&quot;highlighter-rouge&quot;&gt;RedisManager&lt;/code&gt; object in
+&lt;code class=&quot;highlighter-rouge&quot;&gt;Illuminate\Redis\RedisManager.php&lt;/code&gt;:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;protected&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;connector&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+      &lt;span class=&quot;k&quot;&gt;switch&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;driver&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+          &lt;span class=&quot;k&quot;&gt;case&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;predis&#39;&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;:&lt;/span&gt;
+              &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Connectors\PredisConnector&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+          &lt;span class=&quot;k&quot;&gt;case&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;phpredis&#39;&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;:&lt;/span&gt;
+              &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Connectors\PhpRedisConnector&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+      &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Here, you can see that we return connector objects based on the driver
+we’ve chosen. These connectors aren’t too interesting, but they both
+define a &lt;code class=&quot;highlighter-rouge&quot;&gt;connect&lt;/code&gt; function that will return a connection object based
+on which driver you’re using:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;c1&quot;&gt;// in PhpRedisConnector
+&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;connect&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;array&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$config&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;array&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$options&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;PhpRedisConnection&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;createClient&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;array_merge&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$config&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$options&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Arr&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;pull&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$config&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;options&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[])&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;)));&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+&lt;span class=&quot;c1&quot;&gt;// in PredisConnector
+&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;connect&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;array&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$config&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;array&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$options&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;$formattedOptions&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;array_merge&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;
+        &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;&#39;timeout&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;mf&quot;&gt;10.0&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;],&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$options&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Arr&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;pull&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$config&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;options&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[])&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;PredisConnection&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Client&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$config&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$formattedOptions&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;));&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Next, we gotta look at each of these connections to see how their API
+looks to the outside world. Low and behold, each of the connection
+classes inherits an abstract class called &lt;code class=&quot;highlighter-rouge&quot;&gt;Connector&lt;/code&gt; the binds the
+connection to a particular API. The &lt;code class=&quot;highlighter-rouge&quot;&gt;PredisConnection&lt;/code&gt; is not too
+interesting to look at, since it mostly defaults to the abstract class
+for its functionality. But if you take a look at &lt;code class=&quot;highlighter-rouge&quot;&gt;PhpRedisConnection&lt;/code&gt;,
+we see that a lot of the commonly used functions like &lt;code class=&quot;highlighter-rouge&quot;&gt;set&lt;/code&gt; and makes
+sure that it works propery with the PhpRedis client:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;set&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$key&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$value&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$expireResolution&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kc&quot;&gt;null&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$expireTTL&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kc&quot;&gt;null&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$flag&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kc&quot;&gt;null&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;command&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;&#39;set&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$key&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$value&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$expireResolution&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$flag&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$expireResolution&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$expireTTL&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;kc&quot;&gt;null&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;]);&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;We got into the weeds here a bit, but if a third Redis client came into
+the PHP world, we could easily write a connector and connection for the
+client and make sure that when we want to perform operations on the
+Redis server, this adapter will tranform our exact same commands we’ve
+been sending to be compatible with the new client.&lt;/p&gt;
+
+&lt;p&gt;We just went through an example with the Redis connection, but this
+similar pattern applies to database connections as well. Laravel allows
+us to use different relational SQL databases like MySQL, Postgres, and
+SQLite. The adapter sits between the database connections and the main
+app to allow us to write the same application code regardless of our
+underlying SQL database.&lt;/p&gt;
+
+&lt;p&gt;Well, I hope that was educational and I encourage the usage of
+adapters/wrappers whenever we’re working with third-party code. Until
+next time, happy coding!&lt;/p&gt;
+</description>
+        <pubDate>Wed, 30 May 2018 18:51:00 -0700</pubDate>
+        <link>http://snags88.github.io/adapter-pattern-in-laravel</link>
+        <guid isPermaLink="true">http://snags88.github.io/adapter-pattern-in-laravel</guid>
+        
+        
+        <category>general</category>
+        
+      </item>
+    
+      <item>
+        <title>The Factory Pattern in Laravel</title>
+        <description>&lt;p&gt;I took a little break this past week, but back on it for the last
+creational pattern. Well, there’s technically two more, but they’re very
+similar so I’m going to combine them into one post.&lt;/p&gt;
+
+&lt;h2 id=&quot;factory-pattern&quot;&gt;Factory Pattern&lt;/h2&gt;
+&lt;p&gt;The factory pattern and the abstract factory patterns are similar in
+that they create objects like a factory by exposing some kind of
+interface to the outside world like &lt;code class=&quot;highlighter-rouge&quot;&gt;createXYZ&lt;/code&gt;.&lt;/p&gt;
+
+&lt;p&gt;Here is a short example:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;PhoneFactory&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;createPhone&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;\Phone&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+&lt;span class=&quot;nv&quot;&gt;$phoneFactory&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;PhoneFactory&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;$phoneA&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$phoneFactory&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;createPhone&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;$phoneB&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$phoneFactory&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;createPhone&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;h2 id=&quot;abstract-factory-pattern&quot;&gt;Abstract Factory Pattern&lt;/h2&gt;
+&lt;p&gt;The main difference between the factory and abstract factory  is that
+the abstract factory pattern is used as a contract to produce objects
+of a similar group. So for instance:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;interface&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;PhoneFactory&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;createPhone&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;AndroidFactory&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;implements&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;PhoneFactory&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;createPhone&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;\AndroidPhone&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;IPhoneFactory&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;implements&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;PhoneFactory&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;createPhone&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;\IPhone&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$user&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;wantsIPhone&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;())&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;$factory&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;IPhoneFactory&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;else&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;$factory&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;AndroidFactory&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+&lt;span class=&quot;nv&quot;&gt;$phone&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;factory&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;createPhone&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;The key with the abstract factory pattern is that the outside world
+doesn’t care which factory is being used as long as it inherits or
+implements the interface of the abstract factory.&lt;/p&gt;
+
+&lt;h2 id=&quot;factory-pattern-in-the-wild-&quot;&gt;Factory Pattern in the Wild 🕵️&lt;/h2&gt;
+&lt;p&gt;In the world of Laravel, we use the &lt;code class=&quot;highlighter-rouge&quot;&gt;factory&lt;/code&gt; helper function to create
+Eloquent models in our tests. The factory helper is used like this &lt;code class=&quot;highlighter-rouge&quot;&gt;$user =
+factory(\App\Models\User::class)-&amp;gt;create();&lt;/code&gt;.&lt;/p&gt;
+
+&lt;p&gt;I dug into the source code a little bit and found that under the hood,
+it uses an object called &lt;code class=&quot;highlighter-rouge&quot;&gt;EloquentFactory&lt;/code&gt;.&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;factory&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;$factory&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;app&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nx&quot;&gt;EloquentFactory&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;class&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;$arguments&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;func_get_args&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+
+  &lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;isset&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$arguments&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;])&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;amp;&amp;amp;&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;is_string&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$arguments&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]))&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$factory&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;of&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$arguments&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;0&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;],&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$arguments&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;])&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;times&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$arguments&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;??&lt;/span&gt; &lt;span class=&quot;kc&quot;&gt;null&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;elseif&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;isset&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$arguments&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]))&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$factory&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;of&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$arguments&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;0&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;])&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;times&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$arguments&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]);&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+  &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$factory&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;of&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$arguments&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;0&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]);&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Ok, next question: What is this &lt;code class=&quot;highlighter-rouge&quot;&gt;of&lt;/code&gt; function called on the &lt;code class=&quot;highlighter-rouge&quot;&gt;EloquentFactory&lt;/code&gt;?
+Well, it uses another class called &lt;code class=&quot;highlighter-rouge&quot;&gt;FactoryBuilder&lt;/code&gt; where we pass along the name of
+the class we want to create from the factory.&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;of&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$class&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$name&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;default&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;FactoryBuilder&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;$class&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$name&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;definitions&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;states&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;afterMaking&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;afterCreating&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;faker&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Digging more into the &lt;code class=&quot;highlighter-rouge&quot;&gt;FactoryBuilder&lt;/code&gt; code, I traced the commonly used
+&lt;code class=&quot;highlighter-rouge&quot;&gt;create&lt;/code&gt; and &lt;code class=&quot;highlighter-rouge&quot;&gt;make&lt;/code&gt; functions to a function called &lt;code class=&quot;highlighter-rouge&quot;&gt;makeInstance&lt;/code&gt;.
+Here’s what &lt;code class=&quot;highlighter-rouge&quot;&gt;makeInstance&lt;/code&gt; looks like:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;protected&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;makeInstance&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;array&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$attributes&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[])&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Model&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;unguarded&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;()&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;use&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$attributes&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;$instance&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;class&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;
+      &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;getRawAttributes&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$attributes&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;isset&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;connection&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;))&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+      &lt;span class=&quot;nv&quot;&gt;$instance&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;setConnection&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;connection&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$instance&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;});&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Ah, finally we find the factory pattern with some meta-programming
+involved. In the contructor of the object, we passed in the class name
+and stored it to &lt;code class=&quot;highlighter-rouge&quot;&gt;$this-&amp;gt;class&lt;/code&gt;. PHP allows you to hold the names of
+class, function, and variables in another variable to be used later. In
+the example here, we see that the string held in &lt;code class=&quot;highlighter-rouge&quot;&gt;$this-&amp;gt;class&lt;/code&gt; is used
+to instantiate a new object by simply doing &lt;code class=&quot;highlighter-rouge&quot;&gt;new $this-&amp;gt;class()&lt;/code&gt;. Whoa.&lt;/p&gt;
+
+&lt;p&gt;Well, hopefully that gave you some insight into what the factory pattern
+is and how it’s used in Laravel’s factories to help you create instances
+of Eloquent models. Until next time, happy coding!&lt;/p&gt;
+</description>
+        <pubDate>Fri, 25 May 2018 18:51:00 -0700</pubDate>
+        <link>http://snags88.github.io/factory-pattern-in-laravel</link>
+        <guid isPermaLink="true">http://snags88.github.io/factory-pattern-in-laravel</guid>
+        
+        
+        <category>general</category>
+        
+      </item>
+    
+      <item>
+        <title>The Singleton Pattern in Laravel</title>
+        <description>&lt;p&gt;Alright, next up in the creational design patterns is the singleton
+pattern. Its pretty easy to remember this one. The singleton pattern is
+when a class has a single instance of itself. Meaning that whenver I
+want to use an instance of the class, I’m using the same instance.&lt;/p&gt;
+
+&lt;h2 id=&quot;singleton-pattern&quot;&gt;Singleton Pattern&lt;/h2&gt;
+&lt;p&gt;The implementation of the singleton pattern varies based on the
+language. I remember for Ruby, there’s a built in &lt;code class=&quot;highlighter-rouge&quot;&gt;Singleton&lt;/code&gt; module
+that you can just mixin to a class and it’ll become a singleton.&lt;/p&gt;
+
+&lt;p&gt;For PHP, it’s a little bit more complicated. Digging around, I found
+that the typical way to implement the singleton pattern is to create a
+singleton trait (basically a Ruby module) that can be used by any class
+that wants to be a singleton.&lt;/p&gt;
+
+&lt;p&gt;The singleton trait might look something like this:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;nx&quot;&gt;trait&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Singleton&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+   &lt;span class=&quot;k&quot;&gt;protected&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;static&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$instance&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kc&quot;&gt;null&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+  &lt;span class=&quot;sd&quot;&gt;/** call this method to get instance */&lt;/span&gt;
+   &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;static&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;instance&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(){&lt;/span&gt;
+      &lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;static&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$instance&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;===&lt;/span&gt; &lt;span class=&quot;kc&quot;&gt;null&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;){&lt;/span&gt;
+         &lt;span class=&quot;k&quot;&gt;static&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$instance&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;static&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+      &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+      &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;static&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$instance&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+  &lt;span class=&quot;sd&quot;&gt;/** protected to prevent cloning */&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;protected&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__clone&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(){&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+  &lt;span class=&quot;sd&quot;&gt;/** protected to prevent instantiation from outside of the class */&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;protected&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__construct&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(){&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Most notably, the singleton trait implements the constructor and clone
+function as protected. It also uses a static variable to hold the
+single instance of the class. The only way to get an instance of this
+object is by using the static &lt;code class=&quot;highlighter-rouge&quot;&gt;instance&lt;/code&gt; method: &lt;code class=&quot;highlighter-rouge&quot;&gt;MyClass::instance()&lt;/code&gt;.&lt;/p&gt;
+
+&lt;p&gt;So why all the fuss about singletons? Its useful for when a class has
+some configuration that it registers and never changes for the duration
+of its existance. For example, if I have a class that talks to GitHub’s
+API, I probably designed it so that you can pass in configurations to
+its constructor like my API key and version. The rest of the interface
+on the client object would just accept paramters to make API calls and
+return the response. Thus, it’s unnecessary to instantiate multiple copies
+of this class.&lt;/p&gt;
+
+&lt;p&gt;One downside to keep in mind is that these instances are held in memory so
+they will never get garbage collected. If you have a ton of singletons,
+you might be holding on to a lot of unnecessary memory space.&lt;/p&gt;
+
+&lt;h2 id=&quot;singleton-pattern-in-the-wild-&quot;&gt;Singleton Pattern in the Wild 🕵️&lt;/h2&gt;
+&lt;p&gt;In the world of Laravel, there is a concept of Service Containers. You
+can read more about them in their &lt;a href=&quot;https://laravel.com/docs/5.6/container&quot; target=&quot;_blank&quot;&gt;official documentation&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;The tl;dr of Service Containers is that at the application’s boot, you
+can register and bind various classes to the service container (via
+service providers) to be resolved elsewhere in your app. For example,
+one of the things you can do is register a class and have it injected
+into other places like your controller’s constructor or actions. You
+just type hint the class you want and BAM! the registered class is
+injected into your function. Dependency injection FTW:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;c1&quot;&gt;// binding a class to the service container
+&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;app&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;bind&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nx&quot;&gt;MyAwesomeClass&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;class&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$app&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;MyAwesomeClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;});&lt;/span&gt;
+
+
+&lt;span class=&quot;c1&quot;&gt;// in a controller somewhere in your app...
+&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;show&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nx&quot;&gt;MyAwesomeClass&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$awesomeThing&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;c1&quot;&gt;// ...
+&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;One thing to note about the implementation of the service container in
+Laravel is that it uses a &lt;code class=&quot;highlighter-rouge&quot;&gt;Container&lt;/code&gt; singleton object to keep track of
+all the bindings/instances that have been registered/resolved for the app.
+This actually makes a lot of sense because we have 1 app so we should
+have 1 container for the app. In fact, the &lt;code class=&quot;highlighter-rouge&quot;&gt;Container&lt;/code&gt; singleton object
+implements the singleton pattern we wrote out in the previous section.
+You can see it in the source code &lt;a href=&quot;https://github.com/laravel/framework/blob/b8e2cd03663bad9cf91342b641ca96573b06dd0f/src/Illuminate/Container/Container.php#L1171-L1178&quot; target=&quot;_blank&quot;&gt;here&lt;/a&gt;&lt;/p&gt;
+
+&lt;p&gt;Funny thing is that I actually set out write about how you can bind
+singletons to Laravel’s service container, but while I was digging
+through the &lt;code class=&quot;highlighter-rouge&quot;&gt;Container&lt;/code&gt; object in the framework’s source code, I
+found that it uses the singleton pattern. That’s pretty neat that I was able
+to recognize the pattern now that I’ve seen it written in PHP. Well,
+that’s all I have for now. Happy coding!&lt;/p&gt;
+</description>
+        <pubDate>Sat, 19 May 2018 10:51:00 -0700</pubDate>
+        <link>http://snags88.github.io/singleton-pattern-in-laravel</link>
+        <guid isPermaLink="true">http://snags88.github.io/singleton-pattern-in-laravel</guid>
+        
+        
+        <category>general</category>
+        
+      </item>
+    
+      <item>
+        <title>The Prototype Pattern in Laravel</title>
+        <description>&lt;p&gt;I’m going to be talking about another creational pattern called the
+&lt;strong&gt;prototype pattern&lt;/strong&gt; today. This should be pretty straight forward to
+implement in a lot of high-level languages and we’ll take a look at a
+common place we use it in Laravel.&lt;/p&gt;
+
+&lt;h2 id=&quot;prototype-pattern&quot;&gt;Prototype Pattern&lt;/h2&gt;
+&lt;p&gt;The prototype pattern is one of the more simple ones to understand. In
+this creational pattern, we create a new object by copying an existing
+object. Wow, that simple?! Yes. That simple.&lt;/p&gt;
+
+&lt;p&gt;PHP provides us a nice tool to easily copy an object too! The &lt;code class=&quot;highlighter-rouge&quot;&gt;clone&lt;/code&gt;
+keyword will call the magic function &lt;code class=&quot;highlighter-rouge&quot;&gt;__clone&lt;/code&gt; on an object and return a
+copy of the object.&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;$obj&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Object&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;$obj2&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$obj&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;$obj3&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;clone&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$obj&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+&lt;span class=&quot;sd&quot;&gt;/** returns true */&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;$obj&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;===&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$obj2&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;sd&quot;&gt;/** returns false */&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;$obj&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;===&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$obj3&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Interestingly, we don’t ever need to implement the &lt;code class=&quot;highlighter-rouge&quot;&gt;__clone&lt;/code&gt; function if
+we just want the default behavior. However, there are times where you
+might want to implement custom behavior.&lt;/p&gt;
+
+&lt;p&gt;One of those times is if you want to deep clone an object. By default,
+PHP will only create a copy of the top level object and if the object
+has attributes referencing other objects, we’ll just keep a reference to
+them in our new object. That’s commonly known as shallow copying.
+In deep cloning, not only do we want a copy of the
+original object, but we also want to get copies of all of its
+attributes. In order to get the deep cloning behavior, we’ll need to
+override the default behavior like this:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;TestObject&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__construct&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;objectAttribute&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;OtherObject&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+  &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__clone&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;objectAttribute&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;clone&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;objectAttribute&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Yes, we just used &lt;code class=&quot;highlighter-rouge&quot;&gt;clone&lt;/code&gt; to implement deep cloning.&lt;/p&gt;
+
+&lt;p&gt;No, that’s not cheating. I think… 😅&lt;/p&gt;
+
+&lt;h2 id=&quot;prototype-pattern-in-the-wild-&quot;&gt;Prototype Pattern in the Wild 🕵️&lt;/h2&gt;
+&lt;p&gt;Since cloning objects is not a common interaction with the Laravel
+framework, we’ll need to dig a little big deeper in the code to see this
+pattern in the wild.&lt;/p&gt;
+
+&lt;p&gt;One of the most common places where we see cloning in the Laravel
+framework is around dispatching events and jobs in queues. It seems like
+when we queue up a job or event, we need to process any arguments passed
+to the job/event. Since those arguments could be reused further down in
+the code execution, it’s much safer for the framework to clone the
+argument and mutate the cloned object rather than the original
+(immutability anyone?).&lt;/p&gt;
+
+&lt;p&gt;Here’s some example code from the
+&lt;a href=&quot;https://github.com/laravel/framework/blob/9cf82b9fa7edf5a66a78e69c91abb685f13ed4a1/src/Illuminate/Events/Dispatcher.php&quot; target=&quot;_blank&quot;&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;Illumiate\Events\Dispatcher&lt;/code&gt;&lt;/a&gt;
+class:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;protected&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;createQueuedHandlerCallable&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$class&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+      &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;()&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;use&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$class&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+          &lt;span class=&quot;nv&quot;&gt;$arguments&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;array_map&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$a&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+              &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;is_object&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$a&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;clone&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$a&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$a&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+          &lt;span class=&quot;p&quot;&gt;},&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;func_get_args&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;());&lt;/span&gt;
+          &lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;handlerWantsToBeQueued&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$class&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$arguments&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;))&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+              &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;queueHandler&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$class&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$arguments&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+          &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+      &lt;span class=&quot;p&quot;&gt;};&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Wow do I see some object arguments being cloned before we pass it along to the
+queue handler? 👀&lt;/p&gt;
+
+&lt;h3 id=&quot;another-example-in-the-wild&quot;&gt;Another example in the wild&lt;/h3&gt;
+&lt;p&gt;Another small example I can give is in the commonly used DateTime library
+called &lt;a href=&quot;https://carbon.nesbot.com/docs/&quot;&gt;Carbon&lt;/a&gt;. Carbon objects are
+mutable so there are times when you do some calculation based on a date.
+But in order to do the calculation, you add some date to the original.
+Well now you’ve mutated the original date. To get around that, you need
+to &lt;code class=&quot;highlighter-rouge&quot;&gt;clone&lt;/code&gt; the Carbon object.  Carbon exposes an API called &lt;code class=&quot;highlighter-rouge&quot;&gt;copy()&lt;/code&gt; to
+create clones of the Carbon object. To see the implementation of &lt;code class=&quot;highlighter-rouge&quot;&gt;copy()&lt;/code&gt; see
+&lt;a href=&quot;https://github.com/briannesbitt/Carbon/blob/b4d5ba6a2222cd80af1d51694015628bf0f7fed0/src/Carbon/Carbon.php#L937-L945&quot;&gt;this link&lt;/a&gt;.
+This code example is straight from their docs:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;$dt&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Carbon&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;now&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;echo&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$dt&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;diffInYears&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$dt&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;copy&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;addYear&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;());&lt;/span&gt;
+
+&lt;span class=&quot;sd&quot;&gt;/** $dt was unchanged and still holds the value of Carbon:now() */&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Well I went into a bit of a rabbit hole of learning how &lt;code class=&quot;highlighter-rouge&quot;&gt;clone&lt;/code&gt; works in
+PHP and digging around the Laravel framework code. Hopefully you learned
+about the Prototype pattern and its usage. Cloning objects encourages
+immutable programming and may lead to avoiding some head-scratching bugs
+(speaking from personal experience… looking at you Moment.js 😑). Well
+thanks for reading and as always, happy coding!&lt;/p&gt;
+</description>
+        <pubDate>Wed, 16 May 2018 17:51:00 -0700</pubDate>
+        <link>http://snags88.github.io/prototype-pattern-in-laravel</link>
+        <guid isPermaLink="true">http://snags88.github.io/prototype-pattern-in-laravel</guid>
+        
+        
+        <category>general</category>
+        
+      </item>
+    
+      <item>
+        <title>The Builder Pattern in Laravel</title>
+        <description>&lt;p&gt;Wow I should have waited another 10 days so I could have written a new
+blog post on the 1 year anniversary of not writing in my blog… jk. I
+also like how my last post was about trying to learn Python and now I’m
+talking about PHP. I guess a quick catch up of what happened over the
+last year:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;I left Flatiron School last May.&lt;/li&gt;
+  &lt;li&gt;I started at Curology in July where I work in the Laravel framework (PHP) and
+React + MobX on the front-end.&lt;/li&gt;
+  &lt;li&gt;Also just attended a conference last week and realized I’ve been
+slacking off since I started at Curology hence the sudden revival of
+the blog.&lt;/li&gt;
+  &lt;li&gt;Between July and last week, I’ve been on a quest to find the holy
+grail and fight off vicious dragons… where holy grail = PHP/Laravel
+knowledge and vicious dragons = random bugs that I probably caused
+myself.&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;In any case, felt like I should get back into the good ol’ technical
+writing. And since I already know that I’m going to have trouble
+writing consistently, I decided to choose a theme to provide me
+blogging topics for the next few weeks (months? 😱). My
+writing topic will be…&lt;/p&gt;
+
+&lt;p&gt;&lt;strong&gt;DRUMROLL&lt;/strong&gt;&lt;/p&gt;
+
+&lt;p&gt;to find each of the &lt;a href=&quot;https://en.wikipedia.org/wiki/Design_Patterns&quot; target=&quot;_blank&quot;&gt;Design Patterns from the Gang of Four&lt;/a&gt; in the Laravel ecosystem.&lt;/p&gt;
+
+&lt;p&gt;So without further ado, here we gooooooo!&lt;/p&gt;
+
+&lt;h2 id=&quot;builder-pattern&quot;&gt;Builder Pattern&lt;/h2&gt;
+&lt;p&gt;The first pattern I’ll talk about is probably one of my favorites and
+it’s called the builder pattern.
+By definition, the builder pattern is a creational
+pattern, where the whole idea is that we’re going to be creating a new
+object that fits our needs. In our code, we’ll just call methods on the
+builder to end up with the exact object we want. To see more of the
+technical definition, you can visit the &lt;a href=&quot;https://en.wikipedia.org/wiki/Builder_pattern&quot; target=&quot;_blank&quot;&gt;wikipedia page
+here&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;As pseudo code, it might look something like this:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;$train&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;TrainBuilder&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;addEngines&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;3&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;addPassengers&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;addLuggageCars&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;getTrain&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;();&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;We have a builder where we can mutate what we’re
+building by using its public API.&lt;/p&gt;
+
+&lt;p&gt;LOOK AT HOW FLUENT THE CODE IS. LOOK AT IT 🤩&lt;/p&gt;
+
+&lt;p&gt;So simple to read and abstracts away what’s happening so we don’t care
+how the passangers are being added. Just that they are added to the
+train! The implementation of the builder might look something like this:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;TrainBuilder&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;private&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$train&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__construct&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;train&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Train&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;addEngines&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nx&quot;&gt;int&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$engines&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;train&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;engines&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$engines&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;addPassengers&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nx&quot;&gt;int&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$passengers&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;for&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$i&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;0&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$i&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;lt;&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$passengers&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$i&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;++&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+            &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;train&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;addPassenger&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Passenger&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+        &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;addLuggageCars&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nx&quot;&gt;int&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$cars&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;train&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;luggageCars&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$cars&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;getTrain&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;train&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Notice the process of adding passangers is different, but as I mentioned
+above, its abstracted away from the rest of the world and the builder object
+has a nice API that’s uniform and predictable. Another thing to note is
+that we’re returning &lt;code class=&quot;highlighter-rouge&quot;&gt;$this&lt;/code&gt; on the methods so that it’s chainable.
+I’m pretty sure there’s a fancy term for it, but I’ll just call it chainable for now.&lt;/p&gt;
+
+&lt;h2 id=&quot;builder-pattern-in-the-wild-&quot;&gt;Builder Pattern in the Wild 🕵️&lt;/h2&gt;
+&lt;p&gt;Alright, this is hella cheating because we don’t have to look much
+further than Laravel to find the builder pattern in action. Laravel’s
+ORM, &lt;em&gt;Eloquent&lt;/em&gt;, uses the builder pattern in… yup you guessed it, the
+query builder.&lt;/p&gt;
+
+&lt;p&gt;The query builder is the object that gets returned anytime you’re doing
+a query on an Eloquent Model like this:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;$users&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;User&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;where&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;&#39;id&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;&amp;lt;&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;100&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;orderBy&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;&#39;created_at&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;desc&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;limit&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;20&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;And as the name suggests, you can continue to build queries like
+complex joins or conditional wheres. Once you’re done building your
+query, you can call any of the fetching methods like &lt;code class=&quot;highlighter-rouge&quot;&gt;get()&lt;/code&gt; or
+&lt;code class=&quot;highlighter-rouge&quot;&gt;first()&lt;/code&gt; to run the query against the database and get a collection or
+single record.&lt;/p&gt;
+
+&lt;p&gt;It’s actually a pretty common pattern for ORMs to have chainable methods
+to build a query. You can see ActiveRecord in Rails also use this pattern
+in their &lt;a href=&quot;http://guides.rubyonrails.org/active_record_querying.html#understanding-the-method-chaining&quot; target=&quot;_blank&quot;&gt;documentation&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;If we take a look at the implementation of the &lt;code class=&quot;highlighter-rouge&quot;&gt;QueryBuilder&lt;/code&gt;methods used
+in the example code, we can see that it is similar to our &lt;code class=&quot;highlighter-rouge&quot;&gt;TrainBuilder&lt;/code&gt;
+example. It returns &lt;code class=&quot;highlighter-rouge&quot;&gt;$this&lt;/code&gt; and mutates its own properties:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-php&quot; data-lang=&quot;php&quot;&gt;&lt;span class=&quot;cp&quot;&gt;&amp;lt;?php&lt;/span&gt;
+&lt;span class=&quot;c1&quot;&gt;// code from https://github.com/laravel/framework/blob/f91e049f9c7b97e0e85d56961d1eeae82a1815a2/src/Illuminate/Database/Query/Builder.php
+&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;Builder&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;c1&quot;&gt;// A bunch of other Builder function implementations
+&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;where&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$column&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$operator&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kc&quot;&gt;null&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$value&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kc&quot;&gt;null&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$boolean&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;and&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;c1&quot;&gt;// Some code handling specific conditions and
+&lt;/span&gt;
+        &lt;span class=&quot;c1&quot;&gt;// delegating to helper functions
+&lt;/span&gt;
+
+        &lt;span class=&quot;nv&quot;&gt;$type&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;Basic&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;wheres&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[]&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;compact&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;
+            &lt;span class=&quot;s1&quot;&gt;&#39;type&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;column&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;operator&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;value&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;boolean&#39;&lt;/span&gt;
+        &lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;!&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$value&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;instanceof&lt;/span&gt; &lt;span class=&quot;nx&quot;&gt;Expression&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+            &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;addBinding&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$value&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;where&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+        &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;orderBy&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$column&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$direction&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;asc&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;unions&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;unionOrders&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;orders&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}[]&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;
+            &lt;span class=&quot;s1&quot;&gt;&#39;column&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$column&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+            &lt;span class=&quot;s1&quot;&gt;&#39;direction&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;strtolower&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$direction&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;==&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;asc&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;asc&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;desc&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+        &lt;span class=&quot;p&quot;&gt;];&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;function&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;limit&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$value&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;$property&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;unions&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;unionLimit&#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;limit&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$value&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;gt;=&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;0&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+            &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;$property&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$value&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+        &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$this&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Alright did I blow your mind yet? I hope so because I have nothing else
+left to show you 😂. I hope this example of a builder pattern in the wild
+shows you the usage and implementation. The builder pattern isn’t for
+every occasion, but when you have something that needs to be built
+differently based on the context of the code, it’s a pretty good sign
+to reach for this pattern.&lt;/p&gt;
+
+&lt;p&gt;At Curology, we recently implemented the builder pattern to handle
+searching for our bottle shipments from the front end. Based on
+different queries passed in by the admin, we built the shipment query
+properly. That builder is now reusable across multiple locations in our
+app.&lt;/p&gt;
+
+&lt;p&gt;Anyway, thanks for reading and happy coding!&lt;/p&gt;
+</description>
+        <pubDate>Mon, 14 May 2018 17:51:00 -0700</pubDate>
+        <link>http://snags88.github.io/builder-pattern-in-laravel</link>
+        <guid isPermaLink="true">http://snags88.github.io/builder-pattern-in-laravel</guid>
+        
+        
+        <category>general</category>
+        
+      </item>
+    
+      <item>
+        <title>Rubyist&#39;s guide to Python</title>
+        <description>&lt;p&gt;Ruby was my first programming language and I love it for the simplicity and the syntactic sugar. Python is another popular high-level language used a lot for its data crunching libraries. I wanted to take some time to compare the difference between the two and point out some differences between Ruby and Python.&lt;/p&gt;
+
+&lt;h2 id=&quot;version-managment&quot;&gt;Version Managment&lt;/h2&gt;
+&lt;p&gt;Ruby has tools to manage the version of the Ruby language you use like &lt;code class=&quot;highlighter-rouge&quot;&gt;rvm&lt;/code&gt; or &lt;code class=&quot;highlighter-rouge&quot;&gt;rbenv&lt;/code&gt;. These tools allow you to
+change the Ruby version you are using globally and by project. Additionally, they isolate your gem libraries by Ruby version
+so that you don’t need to worry about Ruby version compatibility based on the library version.&lt;/p&gt;
+
+&lt;p&gt;Python has a similar tool called &lt;a href=&quot;https://github.com/pyenv/pyenv&quot;&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;pyenv&lt;/code&gt;&lt;/a&gt;. According to the repo, &lt;code class=&quot;highlighter-rouge&quot;&gt;pyenv&lt;/code&gt; was actually forked
+from &lt;code class=&quot;highlighter-rouge&quot;&gt;rbenv&lt;/code&gt; so we should expect similar behavior. The easiest way to install &lt;code class=&quot;highlighter-rouge&quot;&gt;pyenv&lt;/code&gt; on a &lt;a href=&quot;https://github.com/pyenv/pyenv#homebrew-on-mac-os-x&quot;&gt;Mac is to use Homebrew&lt;/a&gt;.
+The alternative is to use their &lt;a href=&quot;https://github.com/pyenv/pyenv-installer&quot;&gt;installer&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;Once you have it installed, you can use the documentation for the &lt;a href=&quot;https://github.com/pyenv/pyenv/blob/master/COMMANDS.md&quot;&gt;various commands&lt;/a&gt;.
+I ended up doing two things. The first was to update my &lt;code class=&quot;highlighter-rouge&quot;&gt;~/.bash_profile&lt;/code&gt; to initialize &lt;code class=&quot;highlighter-rouge&quot;&gt;pyenv&lt;/code&gt;. You can see the changes in my dotfiles &lt;a href=&quot;https://github.com/snags88/dotfiles/blob/6fea99e9a9c59169adbe02cf69b3f9610cde8b34/bash/path.bash#L20-L21&quot;&gt;here&lt;/a&gt;. Then I just installing the most recent version of Python at this time (v3.6.1) and set it as my global version using&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-shell&quot; data-lang=&quot;shell&quot;&gt;&lt;span class=&quot;gp&quot;&gt;$ &lt;/span&gt;pyenv global
+system
+&lt;span class=&quot;gp&quot;&gt;$ &lt;/span&gt;pyenv install 3.6.1
+&lt;span class=&quot;gp&quot;&gt;$ &lt;/span&gt;pyenv global 3.6.1
+&lt;span class=&quot;gp&quot;&gt;$ &lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;exec&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;$SHELL&lt;/span&gt;
+&lt;span class=&quot;c&quot;&gt;# Refresh your shell environment&lt;/span&gt;
+&lt;span class=&quot;gp&quot;&gt;$ &lt;/span&gt;python --version
+Python 3.6.1&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;h2 id=&quot;libraries&quot;&gt;Libraries&lt;/h2&gt;
+&lt;p&gt;In Ruby, we have gems. Gems are just little (well, sometimes big) libraries that we can install in our projects to make development faster. You usually hit the RubyGems hosting service to download the libraries.&lt;/p&gt;
+
+&lt;p&gt;In Python, the library manager is called &lt;code class=&quot;highlighter-rouge&quot;&gt;pip&lt;/code&gt; and it gets installed with Python if you used the instructions above. You can test it out by typing in &lt;code class=&quot;highlighter-rouge&quot;&gt;$ which pip&lt;/code&gt; in the command line. From there, you can just install various libraries by using the &lt;code class=&quot;highlighter-rouge&quot;&gt;install&lt;/code&gt; command like &lt;code class=&quot;highlighter-rouge&quot;&gt;pip install flask&lt;/code&gt; (Flask is Python’s version of Sinatra in Ruby). &lt;code class=&quot;highlighter-rouge&quot;&gt;pip&lt;/code&gt; goes out to Python Package Index (PyPI) to download all the hosted libraries.&lt;/p&gt;
+
+&lt;h2 id=&quot;project-dependencies&quot;&gt;Project Dependencies&lt;/h2&gt;
+&lt;p&gt;For each project, it’s best practice to manage its dependencies in a source file so that the dependent libraries can be reinstalled regardless of what environment you’re in. In Ruby, there’s a handy gem called &lt;a href=&quot;https://bundler.io/&quot;&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;bundler&lt;/code&gt;&lt;/a&gt; that creates a &lt;code class=&quot;highlighter-rouge&quot;&gt;Gemfile&lt;/code&gt; in your project. Whenever you want to recreate the environment, you can run &lt;code class=&quot;highlighter-rouge&quot;&gt;bundle&lt;/code&gt; and all your dependencies will be installed. Magic!&lt;/p&gt;
+
+&lt;p&gt;I looked for something similar in Python and it seems like there’s 2 things we need:&lt;/p&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;Create an environment by project so that installed libraries do not leak into other projects.&lt;/li&gt;
+  &lt;li&gt;Create a source file that lists are dependencies. We can use this later to install dependencies in other environments.&lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;The solution to the first item was to use &lt;code class=&quot;highlighter-rouge&quot;&gt;virtualenv&lt;/code&gt;. It allows you to spin up virtual environments at will and isolate your work. I’m a huge fan of &lt;a href=&quot;https://python-guide-pt-br.readthedocs.io/en/latest/dev/virtualenvs/&quot;&gt;this article&lt;/a&gt;. It does a nice job of explaining &lt;code class=&quot;highlighter-rouge&quot;&gt;virtualenv&lt;/code&gt; at a high-level, but enough detail to get me going. You can simply install this using &lt;code class=&quot;highlighter-rouge&quot;&gt;$ pip install virtualenv&lt;/code&gt;&lt;/p&gt;
+
+&lt;p&gt;I also used &lt;a href=&quot;https://github.com/pyenv/pyenv-virtualenv&quot;&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;pyenv-virtualenv&lt;/code&gt;&lt;/a&gt; to help create virtual environments with &lt;code class=&quot;highlighter-rouge&quot;&gt;pyenv&lt;/code&gt;. From a high-level this tool takes a version of Python you want to use and creates an &lt;code class=&quot;highlighter-rouge&quot;&gt;envs&lt;/code&gt; directory where you can spin up new virtual environments. Then you can just use that environment as if you’re specifying a version of Python you want to use. This tool needs to be installed via Homebrew &lt;code class=&quot;highlighter-rouge&quot;&gt;$ brew install pyenv-virtualenv&lt;/code&gt;. You’ll also need to initialize this tool in your &lt;a href=&quot;https://github.com/snags88/dotfiles/blob/ec1ea56dada60210a65f820916b30302481f51bd/bash/path.bash#L22&quot;&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;.bash_profile&lt;/code&gt;&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;Now to bring actually create a virtual environment for our project, we need to run the following (assuming you’re already in the directory of your project):&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-shell&quot; data-lang=&quot;shell&quot;&gt;&lt;span class=&quot;gp&quot;&gt;$ &lt;/span&gt;pyenv virtual 3.6.1 my_project
+&lt;span class=&quot;c&quot;&gt;# Creates a virtual environment for us. Check it out in ~/.pyenv/versions/&lt;/span&gt;
+&lt;span class=&quot;gp&quot;&gt;$ &lt;/span&gt;pyenv &lt;span class=&quot;nb&quot;&gt;local &lt;/span&gt;my_project
+&lt;span class=&quot;c&quot;&gt;# Sets the local directory&#39;s Python version to be the virtual env we just created inside .python-version&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;The solution to the second item (the source file) is that &lt;code class=&quot;highlighter-rouge&quot;&gt;pip&lt;/code&gt; uses a &lt;code class=&quot;highlighter-rouge&quot;&gt;requirements.txt&lt;/code&gt; file in the project to determine the dependencies. Seems like there’s a &lt;code class=&quot;highlighter-rouge&quot;&gt;$ pip freeze&lt;/code&gt; command that we just need to output into the file. When we need to install the dependencies, we just run an install command:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-shell&quot; data-lang=&quot;shell&quot;&gt;&lt;span class=&quot;gp&quot;&gt;$ &lt;/span&gt;pip freeze &amp;gt; requirements.txt
+&lt;span class=&quot;c&quot;&gt;# Output dependencies into file&lt;/span&gt;
+
+&lt;span class=&quot;gp&quot;&gt;$ &lt;/span&gt;pip install -r requirements.txt
+&lt;span class=&quot;c&quot;&gt;# Install all dependencies&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;It would be nice for the requirements file to be updated automatically like &lt;code class=&quot;highlighter-rouge&quot;&gt;bundler&lt;/code&gt;, but after some Googling around, I couldn’t find any tools or libraries to help with that. I wonder why it doesn’t get auto-generated after each install…&lt;/p&gt;
+
+&lt;h2 id=&quot;interactive-interpreter&quot;&gt;Interactive Interpreter&lt;/h2&gt;
+&lt;p&gt;One of the ways I like to get familar with or test out behavior of a programming language is through a interactive interpretor. In Ruby, there are a few options like &lt;code class=&quot;highlighter-rouge&quot;&gt;irb&lt;/code&gt; and &lt;a href=&quot;http://pryrepl.org/&quot;&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;pry&lt;/code&gt;&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;In Python, you can just run the &lt;code class=&quot;highlighter-rouge&quot;&gt;$ python&lt;/code&gt; command to enter an interactive session. I haven’t found any alternatives for a Python REPL but I’m sure there are alternatives to what comes out of the box.&lt;/p&gt;
+
+&lt;h2 id=&quot;syntax&quot;&gt;Syntax&lt;/h2&gt;
+&lt;p&gt;This is a pretty large topic so I’ll try to start small from working with more primative types and go into creating classes, etc.&lt;/p&gt;
+
+&lt;h3 id=&quot;numbers&quot;&gt;Numbers&lt;/h3&gt;
+&lt;p&gt;Most things are pretty much the same as Ruby except for 2 things I noticed:&lt;/p&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;In Python, division always returns a float value even if it’s perfectly divisible. Ruby always rounds down to the nearest integer.&lt;/li&gt;
+  &lt;li&gt;In Python, there is a “floor division” operator &lt;code class=&quot;highlighter-rouge&quot;&gt;//&lt;/code&gt; that will round the division down to the nearest integer, similar to how Ruby’s regular division works.&lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;h3 id=&quot;strings&quot;&gt;Strings&lt;/h3&gt;
+&lt;p&gt;Strings operate pretty similar to Ruby as well. Concatenation is done with &lt;code class=&quot;highlighter-rouge&quot;&gt;+&lt;/code&gt;. 2 major differences I think are important to note are string interpolation and printing strings:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;Starting with v3.6, Python allows string interpolation using “f-strings”. &lt;a href=&quot;https://stackoverflow.com/a/4450610&quot;&gt;This Stack Overflow answer&lt;/a&gt; does a nice job of summarizing the various ways of string interpolation.&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-python&quot; data-lang=&quot;python&quot;&gt;  &lt;span class=&quot;n&quot;&gt;interpolate_me&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;&quot;I&#39;m interpolated!&quot;&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;f&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;Interpolate a variable: {interpolate_me}&quot;&lt;/span&gt;
+  &lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;In Python, printing things out uses the &lt;code class=&quot;highlighter-rouge&quot;&gt;print()&lt;/code&gt; function. In Ruby, &lt;code class=&quot;highlighter-rouge&quot;&gt;puts&lt;/code&gt; is used.&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h3 id=&quot;absence-of-a-value&quot;&gt;Absence of a value&lt;/h3&gt;
+&lt;p&gt;Ruby uses &lt;code class=&quot;highlighter-rouge&quot;&gt;nil&lt;/code&gt; to represent the absence of a value. Python uses a singlton called &lt;code class=&quot;highlighter-rouge&quot;&gt;None&lt;/code&gt;.&lt;/p&gt;
+
+&lt;h3 id=&quot;truthy--falsy-values&quot;&gt;Truthy &amp;amp; Falsy values&lt;/h3&gt;
+&lt;p&gt;In Ruby, all values are truthy except for &lt;code class=&quot;highlighter-rouge&quot;&gt;false&lt;/code&gt; and &lt;code class=&quot;highlighter-rouge&quot;&gt;nil&lt;/code&gt;. In Python, there is a larger list of items that are falsy like &lt;code class=&quot;highlighter-rouge&quot;&gt;0&lt;/code&gt;, any empty list, empty string, and &lt;code class=&quot;highlighter-rouge&quot;&gt;None&lt;/code&gt;. There are more values in this list and you can check the entire list &lt;a href=&quot;https://stackoverflow.com/a/39984051&quot;&gt;here&lt;/a&gt;.&lt;/p&gt;
+
+&lt;h3 id=&quot;arrays&quot;&gt;Arrays&lt;/h3&gt;
+&lt;p&gt;Arrays pretty much work the same between the two languages, but the method names are a little different (i.e. &lt;code class=&quot;highlighter-rouge&quot;&gt;push&lt;/code&gt; in Ruby is &lt;code class=&quot;highlighter-rouge&quot;&gt;append&lt;/code&gt; in Python).&lt;/p&gt;
+
+&lt;p&gt;The only thing I noticed was that in Python, you cannot assign an element at an array’s index if nothing exists at that index.&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-python&quot; data-lang=&quot;python&quot;&gt;&lt;span class=&quot;o&quot;&gt;&amp;gt;&amp;gt;&amp;gt;&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;arr&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[]&lt;/span&gt;
+&lt;span class=&quot;o&quot;&gt;&amp;gt;&amp;gt;&amp;gt;&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;arr&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;0&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;ERROR&lt;/span&gt;
+&lt;span class=&quot;o&quot;&gt;&amp;gt;&amp;gt;&amp;gt;&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;arr&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;append&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+&lt;span class=&quot;o&quot;&gt;&amp;gt;&amp;gt;&amp;gt;&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;arr&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;
+&lt;span class=&quot;o&quot;&gt;&amp;gt;&amp;gt;&amp;gt;&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;arr&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;0&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;2&lt;/span&gt;
+&lt;span class=&quot;o&quot;&gt;&amp;gt;&amp;gt;&amp;gt;&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;arr&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;h3 id=&quot;hash-dictionary&quot;&gt;Hash dictionary&lt;/h3&gt;
+&lt;p&gt;In Ruby, key-value pairs stored in a data structure (&lt;code class=&quot;highlighter-rouge&quot;&gt;&lt;span class=&quot;p&quot;&gt;{}&lt;/span&gt;&lt;/code&gt;) are called hashes. In Python, they are called dictionaries. They seem to work the same. The only thing to be careful for in Python is that the hashes &lt;code class=&quot;highlighter-rouge&quot;&gt;&lt;span class=&quot;p&quot;&gt;{}&lt;/span&gt;&lt;/code&gt; are also used to describe “sets” which are like arrays, but with no duplicate values.&lt;/p&gt;
+
+&lt;h3 id=&quot;variables&quot;&gt;Variables&lt;/h3&gt;
+&lt;p&gt;Variable assignments are the exact same in Ruby. No special keyword to declare it, but you need to declare a variable before you use it. Otherwise you get an exception.&lt;/p&gt;
+
+&lt;h3 id=&quot;defining-functionsmethods&quot;&gt;Defining functions/methods&lt;/h3&gt;
+&lt;p&gt;In Ruby, methods are defined by using the &lt;code class=&quot;highlighter-rouge&quot;&gt;def&lt;/code&gt; and &lt;code class=&quot;highlighter-rouge&quot;&gt;end&lt;/code&gt; keyword:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-ruby&quot; data-lang=&quot;ruby&quot;&gt;&lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;some_method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;argument&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;argument&lt;/span&gt; &lt;span class=&quot;c1&quot;&gt;#=&amp;gt; implicit return of argument&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;end&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;In Python, functions are defined similarly, except it’s more dependent on indentation and requires an explicit return value:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-python&quot; data-lang=&quot;python&quot;&gt;&lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;some_method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;argument&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;argument&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; explicit return of argument&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;The other things to note is that Ruby uses the colon &lt;code class=&quot;highlighter-rouge&quot;&gt;:&lt;/code&gt; for keyword arguments, whereas Python uses the equal &lt;code class=&quot;highlighter-rouge&quot;&gt;=&lt;/code&gt;.&lt;/p&gt;
+
+&lt;h3 id=&quot;scoping-rules&quot;&gt;Scoping Rules&lt;/h3&gt;
+&lt;p&gt;In my experience, Ruby’s scoping rules follow a narrow set of rules and are pretty understandable. I learned about how to determine the scope by using the scope gate rules: any time a method, module, or class is defined a new scope is created. Also, there is a global scope that’s at the top level.&lt;/p&gt;
+
+&lt;p&gt;For example the following code snippet makes sense:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-ruby&quot; data-lang=&quot;ruby&quot;&gt;&lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;global variable&#39;&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;test_method&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;&#39;local variable&#39;&lt;/span&gt;
+  &lt;span class=&quot;nb&quot;&gt;puts&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;c1&quot;&gt;#=&amp;gt; prints &#39;local variable&#39; due to shadowing. imagine it as a new &quot;a&quot; variable inside of this scope&lt;/span&gt;
+
+  &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;3&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;].&lt;/span&gt;&lt;span class=&quot;nf&quot;&gt;each&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;do&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;|&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;num&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;|&lt;/span&gt;
+    &lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;num&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;end&lt;/span&gt;
+
+  &lt;span class=&quot;nb&quot;&gt;puts&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;c1&quot;&gt;#=&amp;gt; prints &#39;3&#39; because we reassigned the variable in the loop above&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;end&lt;/span&gt;
+
+&lt;span class=&quot;nb&quot;&gt;puts&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;c1&quot;&gt;#=&amp;gt; prints global variable from global scope&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;test_method&lt;/span&gt;
+&lt;span class=&quot;nb&quot;&gt;puts&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;c1&quot;&gt;#=&amp;gt; prints global variable because variable was modified inside of another scope&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;As I’ve been reading about Python’s scoping rules, it works similarly, but Python really emphasizes the concept of “Namespaces” that maintains the various namespaces and variables within the namespaces using a dictionary (or a ruby hash). As variables are used, Python searches the appropriate namespaces in the order of &lt;strong&gt;Local&lt;/strong&gt;, &lt;strong&gt;Enclosed&lt;/strong&gt;, &lt;strong&gt;Global&lt;/strong&gt;, and &lt;strong&gt;Built-in&lt;/strong&gt; (commonly refered to as LEGB). If nothing is found in any of those namespaces, then a &lt;em&gt;NameError&lt;/em&gt; is raised. So at the end of the day, the below snippet written in Python acts the same as the one above in Ruby:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-python&quot; data-lang=&quot;python&quot;&gt;&lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;&#39;global variable&#39;&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;test_method&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;():&lt;/span&gt;
+    &lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;&#39;local variable&#39;&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;a&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; prints &#39;local variable&#39; due to shadowing. imagine it as a new &quot;a&quot; variable inside of this scope&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;for&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;num&lt;/span&gt; &lt;span class=&quot;ow&quot;&gt;in&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;3&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]:&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;num&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;a&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; prints &#39;3&#39; because we reassigned the variable in the loop above&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;a&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; prints global variable from global scope&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;test_method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;a&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; prints global variable because variable was modified inside of another scope&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;The more interesting part for Python is that there are keywords you can use to actually reference the variables declared in the global or enclosing functions. I’m actually not sure how useful this is due to potential confusion and modifying out of scope variables unintentionally, which could lead to unwanted side effects. In any case, you can do this by using &lt;code class=&quot;highlighter-rouge&quot;&gt;global&lt;/code&gt; or &lt;code class=&quot;highlighter-rouge&quot;&gt;nonlocal&lt;/code&gt;:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-python&quot; data-lang=&quot;python&quot;&gt;&lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;&#39;global variable&#39;&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;test_method&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;():&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;global&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; Tells python to us the globally decalred &quot;a&quot; variable&lt;/span&gt;
+    &lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;&#39;local variable&#39;&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;a&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; prints &#39;local variable&#39; due to reassignment of the variable&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;for&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;num&lt;/span&gt; &lt;span class=&quot;ow&quot;&gt;in&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;3&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]:&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;num&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;a&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; prints &#39;3&#39; because we reassigned the variable in the loop above&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;a&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; prints global variable from global scope&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;test_method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;a&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; prints 3 because the global &quot;a&quot; variable was used inside of &quot;test_method&quot;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;h3 id=&quot;function-objects&quot;&gt;Function objects&lt;/h3&gt;
+&lt;p&gt;In Ruby, methods can’t really be passed around. They need to be wrapped in a Proc or Lamda object. In Python, functions need to be invoked, so if you just have a reference to a function or a method, you can actually pass that around or set them to other variables for access at a later point in time.&lt;/p&gt;
+
+&lt;h3 id=&quot;classes--objects&quot;&gt;Classes &amp;amp; Objects&lt;/h3&gt;
+&lt;p&gt;I’m not going to get too much into the intricates of Ruby’s classes here because this is assuming that we know Ruby pretty well. For Python, there are some similarities, but much more noticeable differences compared to some of the other things we looked into already.&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;You can declare attributes in the body of the class like variables. You can reassign the attributes after class definition and object instantiation:&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-python&quot; data-lang=&quot;python&quot;&gt;  &lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;
+    &lt;span class=&quot;n&quot;&gt;i&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;123&lt;/span&gt;
+
+  &lt;span class=&quot;n&quot;&gt;c&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;MyClass&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; Class def&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;c&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;i&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; 123&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;c&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;i&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;789&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;c&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;i&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; 789&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;o&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; Instance of class&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;o&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;i&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; 789&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;o&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;i&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;456&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;o&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;i&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; 456&lt;/span&gt;
+  &lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;The attributes declared in the class body are class variables. Attributes assigned to &lt;code class=&quot;highlighter-rouge&quot;&gt;self&lt;/code&gt; are instance variables:&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-python&quot; data-lang=&quot;python&quot;&gt;  &lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;
+    &lt;span class=&quot;n&quot;&gt;class_variable&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;&#39;hello from class variable!&#39;&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__init__&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+      &lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;instance_variable&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;name&lt;/span&gt;
+
+  &lt;span class=&quot;n&quot;&gt;o1&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&#39;first object!&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;o2&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&#39;second object!&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;o1&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;class_variable&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; &#39;hello from class variable!&#39;&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;o2&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;class_variable&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; &#39;hello from class variable!&#39;&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;o1&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;instance_variable&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; &#39;first object!&#39;&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;o2&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;instance_variable&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; &#39;second object!&#39;&lt;/span&gt;
+  &lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;The lifecycle hook for object instantiation is &lt;code class=&quot;highlighter-rouge&quot;&gt;def __init__(self)&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-python&quot; data-lang=&quot;python&quot;&gt;  &lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__init__&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;arg1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+      &lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;first_arg&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;arg1&lt;/span&gt;
+
+  &lt;span class=&quot;n&quot;&gt;o&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&#39;first argument!&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;o&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;first_arg&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; &#39;first argument!&#39;&lt;/span&gt;
+  &lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;The first argument in a method definition is the &lt;code class=&quot;highlighter-rouge&quot;&gt;self&lt;/code&gt; keyword (or &lt;code class=&quot;highlighter-rouge&quot;&gt;cls&lt;/code&gt; for class methods). It can be used to get a reference to the current object or class in the method definition&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-python&quot; data-lang=&quot;python&quot;&gt;  &lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__init__&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+      &lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;set_b&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;set_b&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+      &lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;b&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;10&lt;/span&gt;
+
+  &lt;span class=&quot;n&quot;&gt;o&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;x&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;b&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; 10&lt;/span&gt;
+  &lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;Python lets you do multiple inheritance. The ways method calls are looked up is from left to right in the inheritance declaration and depth first. However, Python will make sure that each base class is only looked up once:&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-python&quot; data-lang=&quot;python&quot;&gt;  &lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;BaseClass1&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;BaseClass2&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+    &lt;span class=&quot;c&quot;&gt;# Define class here with `super()` and stuff&lt;/span&gt;
+  &lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;Python doesn’t enforce private variables or methods. It’s up to the developer to denote the private methods by using a single or double underscore before the method name. When this is done, it will actually namespace those attributes or methods with the name of the class. This is called &lt;em&gt;name mangling&lt;/em&gt;:&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-python&quot; data-lang=&quot;python&quot;&gt;  &lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;public_method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+      &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&#39;public method&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__private_method&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+      &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&#39;private method&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+
+  &lt;span class=&quot;n&quot;&gt;o&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;o&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;public_method&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; &#39;public method&#39;&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;o&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;__private_method&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; Throws exception&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;o&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;_MyClass__private_method&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; &#39;private method&#39;&lt;/span&gt;
+  &lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;h2 id=&quot;modules&quot;&gt;Modules&lt;/h2&gt;
+&lt;p&gt;For code organization, it’s nice to keep similar code like a class definition or utility functions in a single file. Ruby uses the keyword &lt;code class=&quot;highlighter-rouge&quot;&gt;require&lt;/code&gt; to import the code into another file. Rails does a lot of magic behind the scenes to make things available to you everywhere in your code source.&lt;/p&gt;
+
+&lt;p&gt;For Python, a similar concept applies, but each file has its own namespace and we use the &lt;code class=&quot;highlighter-rouge&quot;&gt;import&lt;/code&gt; keyword to get code from one file into another. The filename and the module name should match and there’s a set of rules for how it finds the files in detail &lt;a href=&quot;https://docs.python.org/3/tutorial/modules.html#the-module-search-path&quot;&gt;here&lt;/a&gt;. After you’ve imported a module, you can access its namespaced attributes by using dot notation:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-python&quot; data-lang=&quot;python&quot;&gt;&lt;span class=&quot;c&quot;&gt;# module.py&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;printer&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;string&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;string&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;multiplier&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;a&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;b&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;*&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;b&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;__init__&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+        &lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;name&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;name&lt;/span&gt;
+
+    &lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;say_hello&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&#39;Hello, my name is &#39;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+&lt;/span&gt; &lt;span class=&quot;bp&quot;&gt;self&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;name&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&#39;!&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+
+&lt;span class=&quot;c&quot;&gt;# import.py&lt;/span&gt;
+&lt;span class=&quot;kn&quot;&gt;import&lt;/span&gt; &lt;span class=&quot;nn&quot;&gt;module&lt;/span&gt;
+
+&lt;span class=&quot;n&quot;&gt;module&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;printer&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&#39;hello&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; prints &#39;hello&#39;&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;module&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;multiplier&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;4&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;2&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; prints &#39;8&#39;&lt;/span&gt;
+
+&lt;span class=&quot;n&quot;&gt;o&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;module&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;MyClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&#39;Seiji&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;o&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;say_hello&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt; &lt;span class=&quot;c&quot;&gt;#=&amp;gt; prints &#39;Hello, my name is Seiji!&#39;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Also important to note that you can import specific names from your module by doing &lt;code class=&quot;highlighter-rouge&quot;&gt;from module_name import name1, name2&lt;/code&gt; or just import everything into the current namespace by doing &lt;code class=&quot;highlighter-rouge&quot;&gt;from module_name import *&lt;/code&gt;.&lt;/p&gt;
+
+&lt;p&gt;Extending this idea of module imports, you can imagine this is how we can share behavior across different classes and mix them into our class definition:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-python&quot; data-lang=&quot;python&quot;&gt;&lt;span class=&quot;kn&quot;&gt;import&lt;/span&gt; &lt;span class=&quot;nn&quot;&gt;module&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;MyOtherClass&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;printer&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;module&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;printer&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;multiplier&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;module&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;multiplier&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;h2 id=&quot;conclusion&quot;&gt;Conclusion&lt;/h2&gt;
+&lt;p&gt;There are actually more similarities between Python and Ruby than I imagined. Of course there are syntactic differences, but they both are easy to use. Python tends to lean on the side of more explicitness (which is not a bad thing), where as Ruby has some niceness in terms of the developer experience. At the end of the day, the choice of language depends on the problem you’re trying to solve. My next step is to start playing with Django, the Rails equivalent web framework for the Python language.&lt;/p&gt;
+</description>
+        <pubDate>Wed, 24 May 2017 05:30:00 -0700</pubDate>
+        <link>http://snags88.github.io/rubyists-guide-to-python</link>
+        <guid isPermaLink="true">http://snags88.github.io/rubyists-guide-to-python</guid>
+        
+        
+        <category>web-development</category>
+        
+      </item>
+    
+      <item>
+        <title>React: High Order Components</title>
+        <description>&lt;p&gt;I started using React almost a year ago and ran into the concept of high order
+components (HOCs) a few months in. For a long time, whenever I came
+across any libaries that used HOCs, I cringed and just sorta figured out
+how to use it without a full understanding.&lt;/p&gt;
+
+&lt;p&gt;But as I’ve written and used HOCs, it’s become one of my favorite types
+of components/functions to write. What exactly is an HOC? As the React
+documentation defines it:&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;&lt;em&gt;A higher-order component is a function that takes a component and returns a new component.&lt;/em&gt;&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;I like to think of it as a function that intercepts a component you’re
+importing into another file and adds additional behavior. We can use the
+HOCs to accomplish a few things:&lt;/p&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;Share behavior through composition rather than inheritance.&lt;/li&gt;
+  &lt;li&gt;Create abstractions of common component behavior.&lt;/li&gt;
+  &lt;li&gt;Layer multiple behavior together without issues of collision.&lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;To read more about HOCs I recommend Dan Abramov’s post &lt;a href=&quot;https://medium.com/@dan_abramov/mixins-are-dead-long-live-higher-order-components-94a0d2f9e750&quot;&gt;here&lt;/a&gt; and the
+official documentation &lt;a href=&quot;https://facebook.github.io/react/docs/higher-order-components.html&quot;&gt;here&lt;/a&gt;.&lt;/p&gt;
+
+&lt;h2 id=&quot;using-a-high-order-component&quot;&gt;Using a High Order Component&lt;/h2&gt;
+&lt;p&gt;So now that I’ve talked about how awesome and useful HOCs are, let just
+take a quick look at how you use a HOC. Let pretend we have a
+&lt;code class=&quot;highlighter-rouge&quot;&gt;ChildComponent&lt;/code&gt; that we want to render from a &lt;code class=&quot;highlighter-rouge&quot;&gt;ParentComponent&lt;/code&gt;. Our
+HOC will be called &lt;code class=&quot;highlighter-rouge&quot;&gt;HighOrderComponent&lt;/code&gt;.&lt;/p&gt;
+
+&lt;p&gt;Apologies for the horrible horrible syntax highlighting. Apparently
+Rogue does not support &lt;code class=&quot;highlighter-rouge&quot;&gt;jsx&lt;/code&gt; style syntax yet…&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-jsx&quot; data-lang=&quot;jsx&quot;&gt;// ChildComponent.jsx
+import React from &#39;react&#39;;
+
+import HighOrderComponent from &#39;../hoc/HighOrderComponent.jsx&#39;;
+
+class ChildComponent extends React.Component {
+  render() {
+    return(
+      &amp;lt;div&amp;gt;
+        &amp;lt;div&amp;gt;Hello from ChildComponent!&amp;lt;/div&amp;gt;
+        &amp;lt;div&amp;gt;{this.props.parentMessage}&amp;lt;/div&amp;gt;
+      &amp;lt;/div&amp;gt;
+    )
+  }
+}
+
+export default HighOrderComponent(ChildComponent);&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;The most important line of code is the &lt;code class=&quot;highlighter-rouge&quot;&gt;export default&lt;/code&gt; where we are
+invoking the HOC function and passing in our &lt;code class=&quot;highlighter-rouge&quot;&gt;ChildComponent&lt;/code&gt;. The
+return value of the HOC function, another component, will be exported
+from this file.&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-jsx&quot; data-lang=&quot;jsx&quot;&gt;// ParentComponent.jsx
+import React from &#39;react&#39;;
+
+import ChildComponent from &#39;./ChildComponent.jsx&#39;;
+
+class ParentComponent extends React.Component {
+  render() {
+    return(
+      &amp;lt;div&amp;gt;
+        &amp;lt;div&amp;gt;Hello from ParentComponent!&amp;lt;/div&amp;gt;
+        &amp;lt;ChildComponent parentMessage=&#39;Message from parent&#39;/&amp;gt;
+      &amp;lt;/div&amp;gt;
+    )
+  }
+}
+
+export default ParentComponent;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Nothing too special in the implementation of &lt;code class=&quot;highlighter-rouge&quot;&gt;ParentComponent&lt;/code&gt;. Its
+great that we can use &lt;code class=&quot;highlighter-rouge&quot;&gt;ChildComponent&lt;/code&gt; with no knowledge that it is
+wrapped inside a high order component. The resulting html will look like
+this:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-html&quot; data-lang=&quot;html&quot;&gt;&lt;span class=&quot;nt&quot;&gt;&amp;lt;div&amp;gt;&lt;/span&gt;
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;div&amp;gt;&lt;/span&gt;Hello from ParentComponent!&lt;span class=&quot;nt&quot;&gt;&amp;lt;/div&amp;gt;&lt;/span&gt;
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;div&amp;gt;&lt;/span&gt;
+      &lt;span class=&quot;nt&quot;&gt;&amp;lt;div&amp;gt;&lt;/span&gt;Hello from HOC!&lt;span class=&quot;nt&quot;&gt;&amp;lt;/div&amp;gt;&lt;/span&gt;
+      &lt;span class=&quot;nt&quot;&gt;&amp;lt;div&amp;gt;&lt;/span&gt;
+        &lt;span class=&quot;nt&quot;&gt;&amp;lt;div&amp;gt;&lt;/span&gt;Hello from ChildComponent!&lt;span class=&quot;nt&quot;&gt;&amp;lt;/div&amp;gt;&lt;/span&gt;
+        &lt;span class=&quot;nt&quot;&gt;&amp;lt;div&amp;gt;&lt;/span&gt;Message from parent&lt;span class=&quot;nt&quot;&gt;&amp;lt;/div&amp;gt;&lt;/span&gt;
+      &lt;span class=&quot;nt&quot;&gt;&amp;lt;/div&amp;gt;&lt;/span&gt;
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;/div&amp;gt;&lt;/span&gt;
+&lt;span class=&quot;nt&quot;&gt;&amp;lt;/div&amp;gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Note that there in the layer between the Parent and Child render,
+additional &lt;code class=&quot;highlighter-rouge&quot;&gt;div&lt;/code&gt;s are present with a message from the HOC. So anytime
+you wrap a component, you can add additional content or pass additional
+props into the child component. Pretty neat.&lt;/p&gt;
+
+&lt;h2 id=&quot;building-a-high-order-component&quot;&gt;Building a High Order Component&lt;/h2&gt;
+&lt;p&gt;In the previous example, I didn’t show the implementation of the HOC
+beacuse I wanted to show it to you here. I’ll be using ES6 syntax for
+this.&lt;/p&gt;
+
+&lt;p&gt;After building a few HOCs, I’ve come up with a template for building a
+high order component:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-jsx&quot; data-lang=&quot;jsx&quot;&gt;import React from &#39;react&#39;;
+
+const HighOrderComponent = OriginalComponent =&amp;gt; {
+  class NewComponent extends React.Component {
+    render() {
+      return(
+        &amp;lt;OriginalComponent
+          {...this.props}
+          {...this.state}
+        /&amp;gt;
+      )
+    }
+
+    // Add other behavior here and pass in as props to OriginalComponent
+  }
+
+  return NewComponent;
+}
+
+export default HighOrderComponent;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;You can see that we define a function called &lt;code class=&quot;highlighter-rouge&quot;&gt;HighOrderComponent&lt;/code&gt; and
+export it from this file. In the body of the function, we define a new
+React component and return it. The boilerplate just renders the
+&lt;code class=&quot;highlighter-rouge&quot;&gt;OriginalComponent&lt;/code&gt; with no special behavior. One important thing to remember
+is to pass the props that the &lt;code class=&quot;highlighter-rouge&quot;&gt;NewComponent&lt;/code&gt; receives to the
+&lt;code class=&quot;highlighter-rouge&quot;&gt;OriginalComponent&lt;/code&gt;. If you forget to do this, you’ll start seeing props
+disappear!&lt;/p&gt;
+
+&lt;p&gt;If we take the previous example and use our template from above, our
+high order component implementation will look something like this:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-jsx&quot; data-lang=&quot;jsx&quot;&gt;import React from &#39;react&#39;;
+
+const HighOrderComponent = OriginalComponent =&amp;gt; {
+  class NewComponent extends React.Component {
+    render() {
+      return(
+        &amp;lt;div&amp;gt;
+          &amp;lt;div&amp;gt;Hello from HOC!&amp;lt;/div&amp;gt;
+
+          &amp;lt;OriginalComponent
+            {...this.props}
+            {...this.state}
+          /&amp;gt;
+        &amp;lt;/div&amp;gt;
+      )
+    }
+  }
+
+  return NewComponent;
+}
+
+export default HighOrderComponent;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;h2 id=&quot;real-world-example&quot;&gt;Real world example&lt;/h2&gt;
+&lt;p&gt;Equipped with the knowledge of how to build a HOC, let’s examine a real
+world example. I recently had to build a series of dropdown menus for
+our website header. We wanted the menu to close if you clicked anywhere
+outside of the component. In order to implement this, I
+created a high order component called &lt;code class=&quot;highlighter-rouge&quot;&gt;OffClickWrapper&lt;/code&gt; that will
+invoke the callback function &lt;code class=&quot;highlighter-rouge&quot;&gt;onOffClick&lt;/code&gt; that is supplied via props.&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-jsx&quot; data-lang=&quot;jsx&quot;&gt;// OffClickWrapper.jsx
+import React from &#39;react&#39;;
+
+const OffClickWrapper = Component =&amp;gt; {
+  class WrappedComponent extends React.Component {
+    constructor(props) {
+      super(props)
+      this._addOffClickListener();
+    }
+
+    componentWillUnmount() {
+      this._removeOffClickListener();
+    }
+
+    render() {
+      return (
+        &amp;lt;div ref={node =&amp;gt; this.node = node}&amp;gt;
+          &amp;lt;Component {...this.props}/&amp;gt;
+        &amp;lt;/div&amp;gt;
+      )
+    }
+
+    _addOffClickListener() {
+      document.addEventListener(&#39;click&#39;, this._handleOffClick.bind(this), false);
+    }
+
+    _removeOffClickListener() {
+      document.removeEventListener(&#39;click&#39;, this._handleOffClick.bind(this), false);
+    }
+
+    _handleOffClick(e) {
+      if(!this.node) { return; }
+      if(this.node.contains(e.target)) { return; }
+
+      if (typeof this.props.onOffClick === &#39;function&#39;) {
+        this.props.onOffClick(e);
+      }
+    }
+  }
+
+  return WrappedComponent
+}
+
+export default OffClickWrapper;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;The best part about this HOC is that we can use it in our modal
+implementation so that when a user clicks off of the modal, we can close
+it. And since not all modals need to close on an off click, we pick and
+choose which ones have this behavior. Score one for Team Composition!&lt;/p&gt;
+
+&lt;p&gt;Theres a ton of other stuff you can do with HOCs like have it hold
+state, but we’ll save those for another time. Until next time, happy
+coding!&lt;/p&gt;
+</description>
+        <pubDate>Wed, 26 Apr 2017 15:30:00 -0700</pubDate>
+        <link>http://snags88.github.io/react-high-order-components</link>
+        <guid isPermaLink="true">http://snags88.github.io/react-high-order-components</guid>
+        
+        
+        <category>web-development</category>
+        
+      </item>
+    
+  </channel>
+</rss>

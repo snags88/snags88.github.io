@@ -1,0 +1,125 @@
+<!DOCTYPE html> <html> <head> <meta charset="utf-8"> <meta http-equiv="X-UA-Compatible" content="IE=edge"> <meta name="viewport" content="width=device-width, initial-scale=1"> <title>React: High Order Components</title> <meta name="description" content="I started using React almost a year ago and ran into the concept of high ordercomponents (HOCs) a few months in. For a long time, whenever I cameacross any l..."> <link rel="stylesheet" href="/assets/css/main.css"> <link rel="canonical" href="http://snags88.github.io/react-high-order-components"> <link rel="alternate" type="application/rss+xml" title="gem install Seiji" href="http://snags88.github.io/feed.xml"> <script src="/assets/js/modernizr.js"></script> </head> <body"> <main class="wrapper"> <header class="site-header"> <a href="#navbar" id="menu-burger" class="menu-burger">Menu <span class="nav-icon"></span> <svg x="0px" y="0px" width="54px" height="54px" viewBox="0 0 54 54"> <circle fill="transparent" stroke="#000000" stroke-width="1" cx="27" cy="27" r="25" stroke-dasharray="157 157" stroke-dashoffset="157"></circle> </svg> </a> <div id="navbar" class="navbar"> <div class="navigation-wrapper"> <div class="half-block"> <h2>Navigation</h2> <nav> <ul class="no-style primary-nav"> <li><a href="/">Home</a></li> <li><a href="/blog">Blog</a></li> <li><a href="/about">About</a></li> <li><a href="http://github.com/snags88" target="_blank"><i class="icon icon-github"></i> Github</a></li> <li><a href="http://linkedin.com/in/snaganuma" target="_blank"><i class="icon icon-linkedin"></i> LinkedIn</a></li> <li><a href="http://twitter.com/S2k10" target="_blank"><i class="icon icon-twitter"></i> Twitter</a></li> </ul> </nav> </div> </div> </div> </header> <article class="post" itemscope itemtype="http://schema.org/BlogPosting"> <header class="post-header intro"> <div class="intro-in"> <h1 class="post-title" itemprop="name headline">React: High Order Components</h1> <p class="post-meta"><time datetime="2017-04-26T15:30:00-07:00" itemprop="datePublished">Apr 26, 2017</time></p> </div> </header> <div class="post-content container" itemprop="articleBody"> <p>I started using React almost a year ago and ran into the concept of high order components (HOCs) a few months in. For a long time, whenever I came across any libaries that used HOCs, I cringed and just sorta figured out how to use it without a full understanding.</p> <p>But as I’ve written and used HOCs, it’s become one of my favorite types of components/functions to write. What exactly is an HOC? As the React documentation defines it:</p> <blockquote> <p><em>A higher-order component is a function that takes a component and returns a new component.</em></p> </blockquote> <p>I like to think of it as a function that intercepts a component you’re importing into another file and adds additional behavior. We can use the HOCs to accomplish a few things:</p> <ol> <li>Share behavior through composition rather than inheritance.</li> <li>Create abstractions of common component behavior.</li> <li>Layer multiple behavior together without issues of collision.</li> </ol> <p>To read more about HOCs I recommend Dan Abramov’s post <a href="https://medium.com/@dan_abramov/mixins-are-dead-long-live-higher-order-components-94a0d2f9e750">here</a> and the official documentation <a href="https://facebook.github.io/react/docs/higher-order-components.html">here</a>.</p> <h2 id="using-a-high-order-component">Using a High Order Component</h2> <p>So now that I’ve talked about how awesome and useful HOCs are, let just take a quick look at how you use a HOC. Let pretend we have a <code class="highlighter-rouge">ChildComponent</code> that we want to render from a <code class="highlighter-rouge">ParentComponent</code>. Our HOC will be called <code class="highlighter-rouge">HighOrderComponent</code>.</p> <p>Apologies for the horrible horrible syntax highlighting. Apparently Rogue does not support <code class="highlighter-rouge">jsx</code> style syntax yet…</p> <figure class="highlight"><pre><code class="language-jsx" data-lang="jsx">// ChildComponent.jsx
+import React from 'react';
+
+import HighOrderComponent from '../hoc/HighOrderComponent.jsx';
+
+class ChildComponent extends React.Component {
+  render() {
+    return(
+      &lt;div&gt;
+        &lt;div&gt;Hello from ChildComponent!&lt;/div&gt;
+        &lt;div&gt;{this.props.parentMessage}&lt;/div&gt;
+      &lt;/div&gt;
+    )
+  }
+}
+
+export default HighOrderComponent(ChildComponent);</code></pre></figure> <p>The most important line of code is the <code class="highlighter-rouge">export default</code> where we are invoking the HOC function and passing in our <code class="highlighter-rouge">ChildComponent</code>. The return value of the HOC function, another component, will be exported from this file.</p> <figure class="highlight"><pre><code class="language-jsx" data-lang="jsx">// ParentComponent.jsx
+import React from 'react';
+
+import ChildComponent from './ChildComponent.jsx';
+
+class ParentComponent extends React.Component {
+  render() {
+    return(
+      &lt;div&gt;
+        &lt;div&gt;Hello from ParentComponent!&lt;/div&gt;
+        &lt;ChildComponent parentMessage='Message from parent'/&gt;
+      &lt;/div&gt;
+    )
+  }
+}
+
+export default ParentComponent;</code></pre></figure> <p>Nothing too special in the implementation of <code class="highlighter-rouge">ParentComponent</code>. Its great that we can use <code class="highlighter-rouge">ChildComponent</code> with no knowledge that it is wrapped inside a high order component. The resulting html will look like this:</p> <figure class="highlight"><pre><code class="language-html" data-lang="html"><span class="nt">&lt;div&gt;</span>
+  <span class="nt">&lt;div&gt;</span>Hello from ParentComponent!<span class="nt">&lt;/div&gt;</span>
+  <span class="nt">&lt;div&gt;</span>
+      <span class="nt">&lt;div&gt;</span>Hello from HOC!<span class="nt">&lt;/div&gt;</span>
+      <span class="nt">&lt;div&gt;</span>
+        <span class="nt">&lt;div&gt;</span>Hello from ChildComponent!<span class="nt">&lt;/div&gt;</span>
+        <span class="nt">&lt;div&gt;</span>Message from parent<span class="nt">&lt;/div&gt;</span>
+      <span class="nt">&lt;/div&gt;</span>
+  <span class="nt">&lt;/div&gt;</span>
+<span class="nt">&lt;/div&gt;</span></code></pre></figure> <p>Note that there in the layer between the Parent and Child render, additional <code class="highlighter-rouge">div</code>s are present with a message from the HOC. So anytime you wrap a component, you can add additional content or pass additional props into the child component. Pretty neat.</p> <h2 id="building-a-high-order-component">Building a High Order Component</h2> <p>In the previous example, I didn’t show the implementation of the HOC beacuse I wanted to show it to you here. I’ll be using ES6 syntax for this.</p> <p>After building a few HOCs, I’ve come up with a template for building a high order component:</p> <figure class="highlight"><pre><code class="language-jsx" data-lang="jsx">import React from 'react';
+
+const HighOrderComponent = OriginalComponent =&gt; {
+  class NewComponent extends React.Component {
+    render() {
+      return(
+        &lt;OriginalComponent
+          {...this.props}
+          {...this.state}
+        /&gt;
+      )
+    }
+
+    // Add other behavior here and pass in as props to OriginalComponent
+  }
+
+  return NewComponent;
+}
+
+export default HighOrderComponent;</code></pre></figure> <p>You can see that we define a function called <code class="highlighter-rouge">HighOrderComponent</code> and export it from this file. In the body of the function, we define a new React component and return it. The boilerplate just renders the <code class="highlighter-rouge">OriginalComponent</code> with no special behavior. One important thing to remember is to pass the props that the <code class="highlighter-rouge">NewComponent</code> receives to the <code class="highlighter-rouge">OriginalComponent</code>. If you forget to do this, you’ll start seeing props disappear!</p> <p>If we take the previous example and use our template from above, our high order component implementation will look something like this:</p> <figure class="highlight"><pre><code class="language-jsx" data-lang="jsx">import React from 'react';
+
+const HighOrderComponent = OriginalComponent =&gt; {
+  class NewComponent extends React.Component {
+    render() {
+      return(
+        &lt;div&gt;
+          &lt;div&gt;Hello from HOC!&lt;/div&gt;
+
+          &lt;OriginalComponent
+            {...this.props}
+            {...this.state}
+          /&gt;
+        &lt;/div&gt;
+      )
+    }
+  }
+
+  return NewComponent;
+}
+
+export default HighOrderComponent;</code></pre></figure> <h2 id="real-world-example">Real world example</h2> <p>Equipped with the knowledge of how to build a HOC, let’s examine a real world example. I recently had to build a series of dropdown menus for our website header. We wanted the menu to close if you clicked anywhere outside of the component. In order to implement this, I created a high order component called <code class="highlighter-rouge">OffClickWrapper</code> that will invoke the callback function <code class="highlighter-rouge">onOffClick</code> that is supplied via props.</p> <figure class="highlight"><pre><code class="language-jsx" data-lang="jsx">// OffClickWrapper.jsx
+import React from 'react';
+
+const OffClickWrapper = Component =&gt; {
+  class WrappedComponent extends React.Component {
+    constructor(props) {
+      super(props)
+      this._addOffClickListener();
+    }
+
+    componentWillUnmount() {
+      this._removeOffClickListener();
+    }
+
+    render() {
+      return (
+        &lt;div ref={node =&gt; this.node = node}&gt;
+          &lt;Component {...this.props}/&gt;
+        &lt;/div&gt;
+      )
+    }
+
+    _addOffClickListener() {
+      document.addEventListener('click', this._handleOffClick.bind(this), false);
+    }
+
+    _removeOffClickListener() {
+      document.removeEventListener('click', this._handleOffClick.bind(this), false);
+    }
+
+    _handleOffClick(e) {
+      if(!this.node) { return; }
+      if(this.node.contains(e.target)) { return; }
+
+      if (typeof this.props.onOffClick === 'function') {
+        this.props.onOffClick(e);
+      }
+    }
+  }
+
+  return WrappedComponent
+}
+
+export default OffClickWrapper;</code></pre></figure> <p>The best part about this HOC is that we can use it in our modal implementation so that when a user clicks off of the modal, we can close it. And since not all modals need to close on an off click, we pick and choose which ones have this behavior. Score one for Team Composition!</p> <p>Theres a ton of other stuff you can do with HOCs like have it hold state, but we’ll save those for another time. Until next time, happy coding!</p> </div> </article> <footer class="site-footer"> <div class="container"> <ul class="social"> <li><a href="http://github.com/snags88" target="_blank"><i class="icon icon-github"></i></a></li> <li><a href="http://linkedin.com/in/snaganuma" target="_blank"><i class="icon icon-linkedin"></i></a></li> <li><a href="http://twitter.com/S2k10" target="_blank"><i class="icon icon-twitter"></i></a></li> </ul> <p> <small>&copy;2018 All rights reserved. Powered by <a href="http://jekyllrb.com/" target="_blank">Jekyll</a> with <a href="https://github.com/nandomoreirame/dotX" target="_blank">dotX</a> theme.</small> </p> </div> </footer> </main> <script src="/assets/js/jquery-2.1.1.js"></script> <script src="/assets/js/main.js"></script> </body> </html>
